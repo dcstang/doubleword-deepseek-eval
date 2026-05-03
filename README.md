@@ -1,6 +1,6 @@
 # doubleword-deepseek-eval
 
-Compare **DeepSeek-V4-Flash** (via Doubleword API) against **Gemini 3 Flash** (Google Gemini API) on two medical AI tasks, evaluated by **Gemini 3 Pro** as judge.
+Compare **DeepSeek-V4-Flash** (via Doubleword API) against **gemini-3-flash-preview** (Google Gemini API) on two medical AI tasks, evaluated by **gemini-3.1-pro-preview** as judge.
 
 ---
 
