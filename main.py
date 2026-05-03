@@ -378,10 +378,12 @@ def write_report(
 
 def parse_args():
     p = argparse.ArgumentParser(description="DeepSeek vs Gemini medical evaluation")
-    p.add_argument("--skip-long-context", action="store_true", help="Skip Part 1 (load from results/ if available)")
-    p.add_argument("--skip-tool-calling", action="store_true", help="Skip Part 2 (load from results/ if available)")
-    p.add_argument("--skip-judge", action="store_true", help="Skip judge evaluation")
-    p.add_argument("--skip-report", action="store_true", help="Skip final report generation")
+    p.add_argument("--skip-long-context",  action="store_true", help="Skip Part 1 entirely (load from results/ if available)")
+    p.add_argument("--skip-deepseek-lc",   action="store_true", help="Skip DeepSeek LC batch; load DS answers from saved results, re-run Gemini")
+    p.add_argument("--skip-gemini-lc",     action="store_true", help="Skip Gemini LC; load GM answers from saved results, re-run DeepSeek")
+    p.add_argument("--skip-tool-calling",  action="store_true", help="Skip Part 2 (load from results/ if available)")
+    p.add_argument("--skip-judge",         action="store_true", help="Skip judge evaluation")
+    p.add_argument("--skip-report",        action="store_true", help="Skip final report generation")
     return p.parse_args()
 
 
@@ -390,6 +392,39 @@ def load_json_if_exists(path: str):
         with open(path) as f:
             return json.load(f)
     return None
+
+
+def _responses_from_saved_lc(
+    saved: dict,
+    model_key: str,
+    model_name: str,
+) -> "Dict[int, List]":
+    """
+    Reconstruct per-tier ModelResponse lists from long_context_results.json.
+    Used by --skip-deepseek-lc / --skip-gemini-lc to re-use one model's saved
+    answers while the other model is re-evaluated.
+    """
+    from medical_texts import CONTEXT_TIERS
+    from models import ModelResponse
+
+    tier_responses: Dict[int, List] = {}
+    for tier in CONTEXT_TIERS:
+        label = f"{tier // 1000}k"
+        tier_data = saved.get("tiers", {}).get(label, {})
+        responses = []
+        for q in tier_data.get("questions", []):
+            r = q.get(model_key) or {}
+            responses.append(ModelResponse(
+                model_name=model_name,
+                final_text=r.get("answer") or "",
+                input_tokens=r.get("input_tokens", 0),
+                output_tokens=r.get("output_tokens", 0),
+                latency_s=float(r.get("latency_s") or 0.0),
+                batch_mode=bool(r.get("batch_mode", False)),
+                error=r.get("error"),
+            ))
+        tier_responses[tier] = responses
+    return tier_responses
 
 
 def main():
@@ -426,7 +461,7 @@ def main():
 
     # ── Async flow for long context + tool calling ────────────────────────────
     #
-    # Timeline (batch enabled):
+    # Timeline (batch enabled, full run):
     #   T=0   Build/load all 4 tier corpora (cached after first run)
     #   T=0   Submit all 4×5=20 DeepSeek LC questions in ONE batch (non-blocking)
     #   T=0   Run all 4 Gemini tier queries sequentially
@@ -434,17 +469,22 @@ def main():
     #   T=~   Collect DeepSeek batch (poll — likely done by now)
     #   T=~   Save results, run judge, write report
     #
-    # With --skip-long-context both LC steps are skipped and saved results loaded.
+    # Partial re-run flags (useful when one model errors):
+    #   --skip-long-context  : skip Part 1 entirely, load saved results
+    #   --skip-deepseek-lc   : load saved DS answers, re-run Gemini only
+    #   --skip-gemini-lc     : load saved Gemini answers, re-run DeepSeek only
 
+    lc_results = None
     if args.skip_long_context:
         lc_results = load_json_if_exists(lc_path)
         if lc_results:
             print(f"\n[skip] Loaded long context results from {lc_path}")
         else:
-            print("\n[skip] --skip-long-context set but no saved results found; running eval...")
-            args.skip_long_context = False  # fall through to full eval below
+            print("\n[skip] --skip-long-context set but no saved results found; running full eval...")
+            args.skip_long_context = False
 
     ds_batch_id = None
+    ds_tier_responses = None
     gm_tier_responses = None
     tier_corpora = None
 
@@ -454,13 +494,37 @@ def main():
         print("=" * 70)
         tier_corpora = prepare_all_tier_corpora(config)
 
-        # Fire all-tier DeepSeek batch (non-blocking)
-        ds_batch_id = submit_all_tiers_batch(
-            config, deepseek, tier_corpora, config.results_dir
-        )
+        # ── DeepSeek LC ───────────────────────────────────────────────────────
+        if args.skip_deepseek_lc:
+            saved = load_json_if_exists(lc_path)
+            if saved and "tiers" in saved:
+                ds_tier_responses = _responses_from_saved_lc(
+                    saved, "deepseek", config.deepseek_model
+                )
+                print(f"\n[skip-deepseek-lc] Loaded saved DeepSeek LC answers from {lc_path}")
+            else:
+                print("\n[skip-deepseek-lc] No saved multi-tier results found; running DeepSeek LC...")
+                args.skip_deepseek_lc = False
 
-        # Run all Gemini tiers while batch queues
-        gm_tier_responses = run_all_gemini_tiers(config, gemini_flash, tier_corpora)
+        if not args.skip_deepseek_lc:
+            ds_batch_id = submit_all_tiers_batch(
+                config, deepseek, tier_corpora, config.results_dir
+            )
+
+        # ── Gemini LC (runs while DS batch queues) ────────────────────────────
+        if args.skip_gemini_lc:
+            saved = load_json_if_exists(lc_path)
+            if saved and "tiers" in saved:
+                gm_tier_responses = _responses_from_saved_lc(
+                    saved, "gemini_flash", config.gemini_flash_model
+                )
+                print(f"\n[skip-gemini-lc] Loaded saved Gemini LC answers from {lc_path}")
+            else:
+                print("\n[skip-gemini-lc] No saved multi-tier results found; running Gemini LC...")
+                args.skip_gemini_lc = False
+
+        if not args.skip_gemini_lc:
+            gm_tier_responses = run_all_gemini_tiers(config, gemini_flash, tier_corpora)
 
     # ── Part 2: Tool calling (runs while DeepSeek batch is pending) ───────────
     if args.skip_tool_calling:
@@ -473,11 +537,12 @@ def main():
     else:
         tc_results = run_tool_calling_eval(config, deepseek, gemini_flash, config.results_dir)
 
-    # ── Collect DeepSeek batch now (it's had time to process) ────────────────
+    # ── Collect DeepSeek batch / merge and save ───────────────────────────────
     if not args.skip_long_context:
-        ds_tier_responses = collect_all_tiers_batch(
-            config, deepseek, tier_corpora, ds_batch_id, config.results_dir
-        )
+        if not args.skip_deepseek_lc:
+            ds_tier_responses = collect_all_tiers_batch(
+                config, deepseek, tier_corpora, ds_batch_id, config.results_dir
+            )
         lc_results = save_all_tier_results(
             config, tier_corpora,
             ds_tier_responses, gm_tier_responses,

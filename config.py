@@ -63,8 +63,8 @@ def load_config() -> Config:
         deepseek_max_context=int(os.environ.get("DEEPSEEK_MAX_CONTEXT", "65536")),
 
         gemini_api_key=os.environ["GEMINI_API_KEY"],
-        gemini_flash_model=os.environ.get("GEMINI_FLASH_MODEL", "gemini-3.0-flash"),
-        gemini_pro_model=os.environ.get("GEMINI_PRO_MODEL", "gemini-3.0-pro"),
+        gemini_flash_model=os.environ.get("GEMINI_FLASH_MODEL", "gemini-3-flash-preview"),
+        gemini_pro_model=os.environ.get("GEMINI_PRO_MODEL", "gemini-3.1-pro-preview"),
         gemini_max_context=int(os.environ.get("GEMINI_MAX_CONTEXT", "800000")),
 
         target_context_tokens=int(os.environ.get("TARGET_CONTEXT_TOKENS", "800000")),
