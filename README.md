@@ -55,8 +55,14 @@ See `.env.example` for all options including model names, context limits, and pr
 # Full evaluation (Part 1 + Part 2 + Judge + Cost report)
 python main.py
 
-# Skip long-context (re-use saved results, re-run judge)
+# Skip long-context entirely (re-use saved results, re-run judge)
 python main.py --skip-long-context
+
+# Re-run only Gemini LC (e.g. after fixing a model name error); load saved DeepSeek answers
+python main.py --skip-deepseek-lc --skip-tool-calling --skip-judge
+
+# Re-run only DeepSeek LC; load saved Gemini answers
+python main.py --skip-gemini-lc --skip-tool-calling --skip-judge
 
 # Skip both model evals, only re-run judge on saved results
 python main.py --skip-long-context --skip-tool-calling
