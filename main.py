@@ -31,7 +31,13 @@ import time
 from datetime import datetime
 
 from config import load_config
-from eval_long_context import run_long_context_eval
+from eval_long_context import (
+    prepare_corpora,
+    submit_long_context_batch,
+    run_gemini_long_context,
+    collect_long_context_batch,
+    save_long_context_results,
+)
 from eval_tool_calling import run_tool_calling_eval
 from judge import evaluate_long_context, evaluate_tool_calling
 from models import DeepSeekModel, GeminiModel
@@ -362,21 +368,48 @@ def main():
     gemini_pro   = GeminiModel(config.gemini_api_key, config.gemini_pro_model)
 
     eval_start = time.time()
-
-    # ── Part 1: Long context ──────────────────────────────────────────────────
     lc_path = os.path.join(config.results_dir, "long_context_results.json")
+    tc_path = os.path.join(config.results_dir, "tool_calling_results.json")
+
+    # ── Async flow for long context + tool calling ────────────────────────────
+    #
+    # Timeline (batch enabled):
+    #   T=0   Build/load corpus
+    #   T=0   Submit DeepSeek batch to Doubleword (non-blocking, 1h window)
+    #   T=0   Run Gemini long-context questions (concurrent async)
+    #   T=~   Run tool calling for BOTH models (sync, takes a few minutes)
+    #   T=~   Collect DeepSeek batch (poll — may already be done by now)
+    #   T=~   Save LC results and run judge
+    #
+    # With --skip-long-context both steps are skipped and saved results are loaded.
+
     if args.skip_long_context:
         lc_results = load_json_if_exists(lc_path)
         if lc_results:
             print(f"\n[skip] Loaded long context results from {lc_path}")
         else:
             print("\n[skip] --skip-long-context set but no saved results found; running eval...")
-            lc_results = run_long_context_eval(config, deepseek, gemini_flash, config.results_dir)
-    else:
-        lc_results = run_long_context_eval(config, deepseek, gemini_flash, config.results_dir)
+            args.skip_long_context = False  # fall through to full eval below
 
-    # ── Part 2: Tool calling ──────────────────────────────────────────────────
-    tc_path = os.path.join(config.results_dir, "tool_calling_results.json")
+    ds_batch_id = None
+    gm_lc_responses = None
+    ds_corpus = gm_corpus = None
+
+    if not args.skip_long_context:
+        print("\n" + "=" * 70)
+        print("PART 1: LONG CONTEXT — NEEDLE-IN-A-HAYSTACK")
+        print("=" * 70)
+        _, ds_corpus, gm_corpus = prepare_corpora(config)
+
+        # Fire DeepSeek batch (non-blocking)
+        ds_batch_id = submit_long_context_batch(
+            config, deepseek, ds_corpus, config.results_dir
+        )
+
+        # Run Gemini concurrently while batch queues
+        gm_lc_responses = run_gemini_long_context(config, gemini_flash, gm_corpus)
+
+    # ── Part 2: Tool calling (runs while DeepSeek batch is pending) ───────────
     if args.skip_tool_calling:
         tc_results = load_json_if_exists(tc_path)
         if tc_results:
@@ -386,6 +419,17 @@ def main():
             tc_results = run_tool_calling_eval(config, deepseek, gemini_flash, config.results_dir)
     else:
         tc_results = run_tool_calling_eval(config, deepseek, gemini_flash, config.results_dir)
+
+    # ── Collect DeepSeek batch now (it's had time to process) ────────────────
+    if not args.skip_long_context:
+        ds_lc_responses = collect_long_context_batch(
+            config, deepseek, ds_corpus, ds_batch_id, config.results_dir
+        )
+        lc_results = save_long_context_results(
+            config, ds_corpus, gm_corpus,
+            ds_lc_responses, gm_lc_responses,
+            config.results_dir,
+        )
 
     # ── Judge ─────────────────────────────────────────────────────────────────
     lc_eval_path = os.path.join(config.results_dir, "long_context_evaluation.json")

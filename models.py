@@ -1,17 +1,22 @@
 """
 Model wrappers for DeepSeek (via Doubleword OpenAI-compatible API) and Gemini.
 
-Both classes expose:
-  - chat(prompt, system, max_tokens) → ModelResponse
-  - batch_chat(questions, system, max_tokens) → List[ModelResponse]
-  - chat_with_tools(prompt, tool_names, system, max_tokens) → ModelResponse
+DeepSeekModel:
+  - chat()                — synchronous single call
+  - submit_batch()        — upload JSONL + create batch job, returns batch_id (non-blocking)
+  - collect_batch()       — poll until done, parse and return results (blocking)
+  - chat_with_tools()     — synchronous multi-turn tool-call loop
 
-DeepSeek batch uses the OpenAI Batch API with completion_window="1h" (Doubleword
-delayed mode) — roughly 50% cheaper than synchronous calls.
+GeminiModel:
+  - chat()                — synchronous single call
+  - batch_chat()          — concurrent asyncio fallback (or google-genai batch API)
+  - chat_with_tools()     — synchronous multi-turn tool-call loop
 
-Gemini batch uses the google-genai batches API when available (requires the model
-to support it); otherwise falls back to concurrent asyncio requests which still
-parallelises the wall-clock cost without the 1-hr queue.
+The async pattern for long-context eval:
+  batch_id = deepseek.submit_batch(questions)   ← fire and forget
+  gemini_responses = gemini.batch_chat(questions)  ← runs while DS batch queues
+  run_tool_calling_eval(...)                        ← more work while waiting
+  ds_responses = deepseek.collect_batch(batch_id, questions)  ← now wait
 """
 
 import asyncio
@@ -114,27 +119,13 @@ class DeepSeekModel:
 
     # ------------------------------------------------------------------
     # Batch / delayed mode (OpenAI Batch API, completion_window="1h")
+    # Split into submit (non-blocking) + collect (blocking poll).
     # ------------------------------------------------------------------
 
-    def batch_chat(
-        self,
-        questions: List[Dict],   # each dict: {"id": str, "prompt": str}
-        system: str = "You are a knowledgeable medical assistant.",
-        max_tokens: int = 2048,
-        poll_interval_s: int = 30,
-    ) -> List[ModelResponse]:
-        """
-        Submit all questions as one OpenAI batch job with completion_window="1h".
-        This is Doubleword's delayed/cheap mode — typically ~50% off list price.
-        Blocks until the batch completes (up to ~1 hour) then returns all responses.
-        """
-        import io
-
-        print(f"    [batch] Submitting {len(questions)} requests to Doubleword delayed API...")
-        start = time.time()
-
-        # Build JSONL request file
-        batch_requests = [
+    def _build_jsonl(
+        self, questions: List[Dict], system: str, max_tokens: int
+    ) -> bytes:
+        requests = [
             {
                 "custom_id": q["id"],
                 "method": "POST",
@@ -151,90 +142,123 @@ class DeepSeekModel:
             }
             for q in questions
         ]
-        jsonl_bytes = "\n".join(json.dumps(r) for r in batch_requests).encode()
+        return "\n".join(json.dumps(r) for r in requests).encode()
 
+    def _parse_batch_output(
+        self, output_file_id: str, questions: List[Dict], elapsed: float
+    ) -> List[ModelResponse]:
+        raw = self.client.files.content(output_file_id).content
+        results_by_id: Dict[str, dict] = {}
+        for line in raw.decode().splitlines():
+            if line.strip():
+                item = json.loads(line)
+                results_by_id[item["custom_id"]] = item
+
+        responses = []
+        n = len(questions) or 1
+        for q in questions:
+            item = results_by_id.get(q["id"], {})
+            resp_body = item.get("response", {})
+            if resp_body.get("status_code") == 200:
+                body = resp_body["body"]
+                choice = body["choices"][0]
+                usage = body.get("usage", {})
+                responses.append(
+                    ModelResponse(
+                        model_name=self.model,
+                        final_text=choice["message"]["content"] or "",
+                        input_tokens=usage.get("prompt_tokens", 0),
+                        output_tokens=usage.get("completion_tokens", 0),
+                        latency_s=elapsed / n,
+                        batch_mode=True,
+                    )
+                )
+            else:
+                responses.append(
+                    ModelResponse(
+                        model_name=self.model,
+                        final_text="",
+                        latency_s=elapsed / n,
+                        batch_mode=True,
+                        error=str(item.get("error") or resp_body),
+                    )
+                )
+        return responses
+
+    def submit_batch(
+        self,
+        questions: List[Dict],
+        system: str = "You are a knowledgeable medical assistant.",
+        max_tokens: int = 2048,
+    ) -> Optional[str]:
+        """
+        Upload the JSONL request file and create a Doubleword delayed batch job
+        (completion_window="1h"). Returns the batch_id immediately — does NOT wait.
+
+        Returns None on failure (caller should fall back to synchronous mode).
+        """
+        import io
+
+        jsonl_bytes = self._build_jsonl(questions, system, max_tokens)
         try:
-            # Upload the request file
             upload = self.client.files.create(
                 file=("batch_requests.jsonl", io.BytesIO(jsonl_bytes), "application/jsonl"),
                 purpose="batch",
             )
-            print(f"    [batch] File uploaded: {upload.id}")
-
-            # Create the batch job
             batch = self.client.batches.create(
                 input_file_id=upload.id,
                 endpoint="/v1/chat/completions",
                 completion_window="1h",
             )
-            print(f"    [batch] Batch job created: {batch.id} (status: {batch.status})")
+            print(f"    [batch] Job submitted: {batch.id}  status={batch.status}")
+            return batch.id
+        except Exception as exc:
+            print(f"    [batch] Submit failed ({exc}) — will use sync fallback at collect time.")
+            return None
 
-            # Poll until done
-            terminal = {"completed", "failed", "cancelled", "expired"}
+    def collect_batch(
+        self,
+        batch_id: str,
+        questions: List[Dict],
+        poll_interval_s: int = 30,
+        system: str = "You are a knowledgeable medical assistant.",
+        max_tokens: int = 2048,
+    ) -> List[ModelResponse]:
+        """
+        Poll the Doubleword batch job until it reaches a terminal state,
+        then parse and return one ModelResponse per question.
+
+        Falls back to sequential sync calls if the batch failed or the API
+        doesn't support batches.
+        """
+        start = time.time()
+        terminal = {"completed", "failed", "cancelled", "expired"}
+
+        try:
+            batch = self.client.batches.retrieve(batch_id)
             while batch.status not in terminal:
-                time.sleep(poll_interval_s)
-                batch = self.client.batches.retrieve(batch.id)
                 counts = batch.request_counts
                 print(
                     f"    [batch] {batch.id} — {batch.status} "
                     f"(done={counts.completed} failed={counts.failed} total={counts.total})"
                 )
+                time.sleep(poll_interval_s)
+                batch = self.client.batches.retrieve(batch_id)
 
             elapsed = time.time() - start
             print(f"    [batch] Finished in {elapsed/60:.1f} min, status={batch.status}")
 
             if batch.status != "completed":
-                err = f"Batch ended with status={batch.status}"
-                return [
-                    ModelResponse(model_name=self.model, final_text="", error=err, batch_mode=True)
-                    for _ in questions
-                ]
+                raise RuntimeError(f"Batch ended with status={batch.status}")
 
-            # Fetch and parse output
-            raw = self.client.files.content(batch.output_file_id).content
-            results_by_id: Dict[str, dict] = {}
-            for line in raw.decode().splitlines():
-                if line.strip():
-                    item = json.loads(line)
-                    results_by_id[item["custom_id"]] = item
-
-            responses = []
-            for q in questions:
-                item = results_by_id.get(q["id"], {})
-                resp_body = item.get("response", {})
-                if resp_body.get("status_code") == 200:
-                    body = resp_body["body"]
-                    choice = body["choices"][0]
-                    usage = body.get("usage", {})
-                    responses.append(
-                        ModelResponse(
-                            model_name=self.model,
-                            final_text=choice["message"]["content"] or "",
-                            input_tokens=usage.get("prompt_tokens", 0),
-                            output_tokens=usage.get("completion_tokens", 0),
-                            latency_s=elapsed / len(questions),
-                            batch_mode=True,
-                        )
-                    )
-                else:
-                    responses.append(
-                        ModelResponse(
-                            model_name=self.model,
-                            final_text="",
-                            latency_s=elapsed / len(questions),
-                            batch_mode=True,
-                            error=str(item.get("error") or resp_body),
-                        )
-                    )
-            return responses
+            return self._parse_batch_output(batch.output_file_id, questions, elapsed)
 
         except Exception as exc:
-            # Batch API not supported by this endpoint — fall back to sequential sync calls
-            print(f"    [batch] Batch API unavailable ({exc}), falling back to sequential sync...")
-            responses = []
-            for q in questions:
-                responses.append(self.chat(q["prompt"], system=system, max_tokens=max_tokens))
-            return responses
+            print(f"    [batch] Collect failed ({exc}) — falling back to sequential sync...")
+            return [
+                self.chat(q["prompt"], system=system, max_tokens=max_tokens)
+                for q in questions
+            ]
 
     # ------------------------------------------------------------------
     # Tool-calling (synchronous multi-turn loop)
