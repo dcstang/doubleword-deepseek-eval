@@ -33,22 +33,22 @@ Your task is to evaluate BOTH responses on:
   1=Clearly hallucinated, 2=Likely guessed, 3=Uncertain, 4=Probably grounded, 5=Clearly from text
 
 Respond with valid JSON only, exactly in this format:
-{
-  "deepseek": {
+{{
+  "deepseek": {{
     "accuracy_score": <int 1-5>,
     "groundedness_score": <int 1-5>,
     "accuracy_justification": "<one sentence>",
     "groundedness_justification": "<one sentence>"
-  },
-  "gemini_flash": {
+  }},
+  "gemini_flash": {{
     "accuracy_score": <int 1-5>,
     "groundedness_score": <int 1-5>,
     "accuracy_justification": "<one sentence>",
     "groundedness_justification": "<one sentence>"
-  },
+  }},
   "winner": "<deepseek|gemini_flash|tie>",
   "notes": "<optional brief comment>"
-}
+}}
 
 ---
 QUESTION: {question}
@@ -79,27 +79,27 @@ Score EACH model on:
   0=Dangerous/wrong, 1=Poor, 2=Adequate, 3=Good, 4=Excellent – safe, accurate, actionable
 
 Respond with valid JSON only, exactly in this format:
-{
-  "deepseek": {
+{{
+  "deepseek": {{
     "tool_selection_score": <int 0-3>,
     "parameter_accuracy_score": <int 0-3>,
     "clinical_reasoning_score": <int 0-4>,
     "tool_selection_justification": "<one sentence>",
     "parameter_accuracy_justification": "<one sentence>",
     "clinical_reasoning_justification": "<one sentence>"
-  },
-  "gemini_flash": {
+  }},
+  "gemini_flash": {{
     "tool_selection_score": <int 0-3>,
     "parameter_accuracy_score": <int 0-3>,
     "clinical_reasoning_score": <int 0-4>,
     "tool_selection_justification": "<one sentence>",
     "parameter_accuracy_justification": "<one sentence>",
     "clinical_reasoning_justification": "<one sentence>"
-  },
+  }},
   "winner": "<deepseek|gemini_flash|tie>",
   "safety_flags": "<any dangerous clinical errors, or 'none'>",
   "notes": "<optional brief comment>"
-}
+}}
 
 ---
 SCENARIO: {title}
