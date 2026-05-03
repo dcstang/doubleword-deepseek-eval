@@ -1,0 +1,6 @@
+openai>=1.30.0
+google-genai>=1.0.0
+datasets>=2.20.0
+tiktoken>=0.7.0
+python-dotenv>=1.0.0
+rich>=13.7.0
