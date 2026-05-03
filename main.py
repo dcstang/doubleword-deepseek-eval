@@ -4,8 +4,10 @@ DeepSeek-V4-Flash vs Gemini 3 Flash — Medical Evaluation
 
 Two-part benchmark:
   Part 1 — Long context (needle-in-a-haystack):
-    800k-token medical corpus from HuggingFace with 5 planted facts at depths
-    5%, 25%, 50%, 75%, 95%. Each model answers 5 QA questions.
+    Four tiers (200k / 400k / 600k / 800k tokens) of clinical notes from
+    HuggingFace with 5 planted facts at depths 5%, 25%, 50%, 75%, 95%.
+    Each tier uses a different random seed (different notes) but both models
+    see the same notes at every tier.
 
   Part 2 — Tool calling:
     5 clinical scenarios (sepsis, ICU scoring, DVT, TBI, AECOPD) with medical
@@ -32,11 +34,11 @@ from datetime import datetime
 
 from config import load_config
 from eval_long_context import (
-    prepare_corpora,
-    submit_long_context_batch,
-    run_gemini_long_context,
-    collect_long_context_batch,
-    save_long_context_results,
+    prepare_all_tier_corpora,
+    submit_all_tiers_batch,
+    run_all_gemini_tiers,
+    collect_all_tiers_batch,
+    save_all_tier_results,
 )
 from eval_tool_calling import run_tool_calling_eval
 from judge import evaluate_long_context, evaluate_tool_calling
@@ -59,12 +61,22 @@ def compute_cost_summary(
     def tally(results_part: dict, model_key: str):
         inp = out = 0
         batch = False
-        for item in results_part.get("questions", results_part.get("scenarios", [])):
-            r = item.get(model_key, {}) or {}
-            inp += r.get("input_tokens", 0)
-            out += r.get("output_tokens", 0)
-            if r.get("batch_mode"):
-                batch = True
+        # Multi-tier long-context format: tiers -> {label -> {questions: [...]}}
+        if "tiers" in results_part:
+            for tier_data in results_part["tiers"].values():
+                for item in tier_data.get("questions", []):
+                    r = item.get(model_key) or {}
+                    inp += r.get("input_tokens", 0)
+                    out += r.get("output_tokens", 0)
+                    if r.get("batch_mode"):
+                        batch = True
+        else:
+            for item in results_part.get("questions", results_part.get("scenarios", [])):
+                r = item.get(model_key, {}) or {}
+                inp += r.get("input_tokens", 0)
+                out += r.get("output_tokens", 0)
+                if r.get("batch_mode"):
+                    batch = True
         return inp, out, batch
 
     # Eval tokens (judge, always sync)
@@ -168,10 +180,11 @@ def write_report(
     cost_summary: dict,
     results_dir: str,
 ) -> str:
-    lc_sum = lc_eval.get("summary", {})
+    # Multi-tier uses overall_summary; legacy single-tier uses summary
+    lc_overall = lc_eval.get("overall_summary", lc_eval.get("summary", {}))
     tc_sum = tc_eval.get("summary", {})
-    ds_lc = lc_sum.get("deepseek", {})
-    gm_lc = lc_sum.get("gemini_flash", {})
+    ds_lc = lc_overall.get("deepseek", {})
+    gm_lc = lc_overall.get("gemini_flash", {})
     ds_tc = tc_sum.get("deepseek", {})
     gm_tc = tc_sum.get("gemini_flash", {})
 
@@ -180,6 +193,7 @@ def write_report(
     totals  = cost_summary["totals"]
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    multi_tier = "tiers" in lc_eval
 
     lines = [
         f"# DeepSeek-V4-Flash vs Gemini 3 Flash — Medical Evaluation Report",
@@ -195,36 +209,73 @@ def write_report(
         "---",
         "",
         "## Part 1 — Long Context (Needle-in-a-Haystack)",
-        f"Corpus: ~{lc_results.get('deepseek_context_tokens', 0):,} tokens (DeepSeek) / "
-        f"~{lc_results.get('gemini_context_tokens', 0):,} tokens (Gemini)  ",
-        f"5 clinical facts planted at depths: 5%, 25%, 50%, 75%, 95%",
+        "5 clinical facts planted at depths: 5%, 25%, 50%, 75%, 95%",
+        "Four context tiers: 200k / 400k / 600k / 800k tokens  "
+        "(each tier uses a different random seed for varied background notes)",
         "",
-        "### Per-Question Scores (Accuracy / Groundedness out of 5)",
-        "| Q | Depth | DeepSeek Acc | DeepSeek Gnd | Gemini Acc | Gemini Gnd | Winner |",
-        "|---|-------|:---:|:---:|:---:|:---:|:---:|",
     ]
 
-    for q in lc_eval.get("questions", []):
-        j = q.get("judgment", {})
-        ds_j = j.get("deepseek", {})
-        gm_j = j.get("gemini_flash", {})
-        winner = j.get("winner", "?")
-        lines.append(
-            f"| {q['question_id']} | {q['position_percent']}% "
-            f"| {ds_j.get('accuracy_score','?')}/5 | {ds_j.get('groundedness_score','?')}/5 "
-            f"| {gm_j.get('accuracy_score','?')}/5 | {gm_j.get('groundedness_score','?')}/5 "
-            f"| **{winner}** |"
-        )
+    if multi_tier:
+        for tier_label, tier_eval in lc_eval.get("tiers", {}).items():
+            tier_result = lc_results.get("tiers", {}).get(tier_label, {})
+            ds_ctx = tier_result.get("deepseek_context_tokens", 0)
+            gm_ctx = tier_result.get("gemini_context_tokens", 0)
+            ts = tier_eval.get("summary", {})
+            ds_ts = ts.get("deepseek", {})
+            gm_ts = ts.get("gemini_flash", {})
+
+            lines += [
+                f"### Tier {tier_label}",
+                f"Context: ~{ds_ctx:,} tokens (DeepSeek) / ~{gm_ctx:,} tokens (Gemini)",
+                "",
+                "| Q | Depth | DS Acc | DS Gnd | GM Acc | GM Gnd | Winner |",
+                "|---|-------|:---:|:---:|:---:|:---:|:---:|",
+            ]
+            for q in tier_eval.get("questions", []):
+                j = q.get("judgment", {})
+                ds_j = j.get("deepseek", {})
+                gm_j = j.get("gemini_flash", {})
+                winner = j.get("winner", "?")
+                lines.append(
+                    f"| Q{q['question_id']} | {q['position_percent']}% "
+                    f"| {ds_j.get('accuracy_score','?')}/5 | {ds_j.get('groundedness_score','?')}/5 "
+                    f"| {gm_j.get('accuracy_score','?')}/5 | {gm_j.get('groundedness_score','?')}/5 "
+                    f"| **{winner}** |"
+                )
+            lines += [
+                "",
+                f"Tier {tier_label} — DS score {ds_ts.get('total_score','?')}% / "
+                f"GM score {gm_ts.get('total_score','?')}%  "
+                f"winner: **{ts.get('overall_winner','?')}**",
+                "",
+            ]
+    else:
+        lines += [
+            "### Per-Question Scores (Accuracy / Groundedness out of 5)",
+            "| Q | Depth | DeepSeek Acc | DeepSeek Gnd | Gemini Acc | Gemini Gnd | Winner |",
+            "|---|-------|:---:|:---:|:---:|:---:|:---:|",
+        ]
+        for q in lc_eval.get("questions", []):
+            j = q.get("judgment", {})
+            ds_j = j.get("deepseek", {})
+            gm_j = j.get("gemini_flash", {})
+            winner = j.get("winner", "?")
+            lines.append(
+                f"| {q['question_id']} | {q['position_percent']}% "
+                f"| {ds_j.get('accuracy_score','?')}/5 | {ds_j.get('groundedness_score','?')}/5 "
+                f"| {gm_j.get('accuracy_score','?')}/5 | {gm_j.get('groundedness_score','?')}/5 "
+                f"| **{winner}** |"
+            )
+        lines.append("")
 
     lines += [
-        "",
-        "### Long Context Summary",
+        "### Long Context Overall Summary",
         f"| Model | Avg Accuracy | Avg Groundedness | Score | Wins |",
         f"|-------|:---:|:---:|:---:|:---:|",
         f"| DeepSeek-V4-Flash | {ds_lc.get('avg_accuracy','?')}/5 | {ds_lc.get('avg_groundedness','?')}/5 | {ds_lc.get('total_score','?')}% | {ds_lc.get('wins','?')} |",
         f"| Gemini 3 Flash    | {gm_lc.get('avg_accuracy','?')}/5 | {gm_lc.get('avg_groundedness','?')}/5 | {gm_lc.get('total_score','?')}% | {gm_lc.get('wins','?')} |",
         f"",
-        f"**Long context winner: {lc_sum.get('overall_winner', '?').upper()}**",
+        f"**Long context winner: {lc_overall.get('overall_winner', '?').upper()}**",
         "",
         "---",
         "",
@@ -295,8 +346,10 @@ def write_report(
 
     ds_total_wins = ds_lc.get("wins", 0) + ds_tc.get("wins", 0)
     gm_total_wins = gm_lc.get("wins", 0) + gm_tc.get("wins", 0)
-    overall = "DeepSeek-V4-Flash" if ds_total_wins > gm_total_wins else (
-              "Gemini 3 Flash" if gm_total_wins > ds_total_wins else "Tie")
+    overall = (
+        "DeepSeek-V4-Flash" if ds_total_wins > gm_total_wins else
+        ("Gemini 3 Flash" if gm_total_wins > ds_total_wins else "Tie")
+    )
 
     lines += [
         f"| Dimension | DeepSeek-V4-Flash | Gemini 3 Flash |",
@@ -374,14 +427,14 @@ def main():
     # ── Async flow for long context + tool calling ────────────────────────────
     #
     # Timeline (batch enabled):
-    #   T=0   Build/load corpus
-    #   T=0   Submit DeepSeek batch to Doubleword (non-blocking, 1h window)
-    #   T=0   Run Gemini long-context questions (concurrent async)
-    #   T=~   Run tool calling for BOTH models (sync, takes a few minutes)
-    #   T=~   Collect DeepSeek batch (poll — may already be done by now)
-    #   T=~   Save LC results and run judge
+    #   T=0   Build/load all 4 tier corpora (cached after first run)
+    #   T=0   Submit all 4×5=20 DeepSeek LC questions in ONE batch (non-blocking)
+    #   T=0   Run all 4 Gemini tier queries sequentially
+    #   T=~   Run tool calling for BOTH models (sync, fills time while batch queues)
+    #   T=~   Collect DeepSeek batch (poll — likely done by now)
+    #   T=~   Save results, run judge, write report
     #
-    # With --skip-long-context both steps are skipped and saved results are loaded.
+    # With --skip-long-context both LC steps are skipped and saved results loaded.
 
     if args.skip_long_context:
         lc_results = load_json_if_exists(lc_path)
@@ -392,22 +445,22 @@ def main():
             args.skip_long_context = False  # fall through to full eval below
 
     ds_batch_id = None
-    gm_lc_responses = None
-    ds_corpus = gm_corpus = None
+    gm_tier_responses = None
+    tier_corpora = None
 
     if not args.skip_long_context:
         print("\n" + "=" * 70)
-        print("PART 1: LONG CONTEXT — NEEDLE-IN-A-HAYSTACK")
+        print("PART 1: LONG CONTEXT — NEEDLE-IN-A-HAYSTACK (4 tiers)")
         print("=" * 70)
-        _, ds_corpus, gm_corpus = prepare_corpora(config)
+        tier_corpora = prepare_all_tier_corpora(config)
 
-        # Fire DeepSeek batch (non-blocking)
-        ds_batch_id = submit_long_context_batch(
-            config, deepseek, ds_corpus, config.results_dir
+        # Fire all-tier DeepSeek batch (non-blocking)
+        ds_batch_id = submit_all_tiers_batch(
+            config, deepseek, tier_corpora, config.results_dir
         )
 
-        # Run Gemini concurrently while batch queues
-        gm_lc_responses = run_gemini_long_context(config, gemini_flash, gm_corpus)
+        # Run all Gemini tiers while batch queues
+        gm_tier_responses = run_all_gemini_tiers(config, gemini_flash, tier_corpora)
 
     # ── Part 2: Tool calling (runs while DeepSeek batch is pending) ───────────
     if args.skip_tool_calling:
@@ -422,12 +475,12 @@ def main():
 
     # ── Collect DeepSeek batch now (it's had time to process) ────────────────
     if not args.skip_long_context:
-        ds_lc_responses = collect_long_context_batch(
-            config, deepseek, ds_corpus, ds_batch_id, config.results_dir
+        ds_tier_responses = collect_all_tiers_batch(
+            config, deepseek, tier_corpora, ds_batch_id, config.results_dir
         )
-        lc_results = save_long_context_results(
-            config, ds_corpus, gm_corpus,
-            ds_lc_responses, gm_lc_responses,
+        lc_results = save_all_tier_results(
+            config, tier_corpora,
+            ds_tier_responses, gm_tier_responses,
             config.results_dir,
         )
 
@@ -477,12 +530,14 @@ def main():
     elapsed = time.time() - eval_start
     print(f"\nTotal wall-clock time: {elapsed/60:.1f} min")
     print("\nAll results saved to:", config.results_dir)
-    print("  long_context_results.json")
-    print("  tool_calling_results.json")
-    print("  long_context_evaluation.json")
-    print("  tool_calling_evaluation.json")
+    print("  long_context_results.json      (4 tiers × 5 questions)")
+    print("  tool_calling_results.json      (5 scenarios)")
+    print("  long_context_evaluation.json   (judge scores per tier)")
+    print("  tool_calling_evaluation.json   (judge scores per scenario)")
     print("  cost_summary.json")
     print("  final_report.md")
+    print("  corpus_cache_200k.txt  corpus_cache_400k.txt  ...")
+    print("  (delete corpus_cache_*.txt to force a fresh HuggingFace download)")
 
 
 if __name__ == "__main__":

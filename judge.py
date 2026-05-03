@@ -162,37 +162,35 @@ def _call_judge(
 # Public API
 # ---------------------------------------------------------------------------
 
-def evaluate_long_context(
-    config: Config,
+def _evaluate_questions(
     judge: GeminiModel,
-    lc_results: dict,
-    results_dir: str,
-) -> dict:
-    print("\n" + "=" * 70)
-    print("JUDGE: EVALUATING LONG CONTEXT RESULTS")
-    print("=" * 70)
-
-    evaluation = {
-        "part": "long_context_evaluation",
-        "judge_model": config.gemini_pro_model,
-        "questions": [],
-        "summary": {},
-    }
-
-    ds_accuracy_total = ds_groundedness_total = 0
-    gm_accuracy_total = gm_groundedness_total = 0
+    questions: list,
+) -> tuple:
+    """
+    Judge a flat list of questions.  Returns (evaluated_list, ds_acc, ds_gnd, gm_acc, gm_gnd, ds_wins, gm_wins, ties).
+    """
+    evaluated = []
+    ds_acc_total = ds_gnd_total = gm_acc_total = gm_gnd_total = 0
     ds_wins = gm_wins = ties = 0
 
-    for q in lc_results["questions"]:
+    for q in questions:
         q_id = q["question_id"]
-        print(f"\n  Judging Q{q_id} [{q['position_percent']}% depth]...")
+        print(f"\n    Judging Q{q_id} [{q['position_percent']}% depth]...")
 
         judge_prompt = LONG_CONTEXT_JUDGE_PROMPT.format(
             question=q["question"],
             expected_answer=q["expected_answer"],
             position_percent=q["position_percent"],
-            deepseek_answer=q["deepseek"]["answer"] if q["deepseek"] and not q["deepseek"].get("error") else "[ERROR]",
-            gemini_flash_answer=q["gemini_flash"]["answer"] if q["gemini_flash"] and not q["gemini_flash"].get("error") else "[ERROR]",
+            deepseek_answer=(
+                q["deepseek"]["answer"]
+                if q["deepseek"] and not q["deepseek"].get("error")
+                else "[ERROR]"
+            ),
+            gemini_flash_answer=(
+                q["gemini_flash"]["answer"]
+                if q["gemini_flash"] and not q["gemini_flash"].get("error")
+                else "[ERROR]"
+            ),
         )
 
         judgment = _call_judge(judge, judge_prompt)
@@ -202,10 +200,10 @@ def evaluate_long_context(
         gm_acc = judgment.get("gemini_flash", {}).get("accuracy_score", 0)
         gm_gnd = judgment.get("gemini_flash", {}).get("groundedness_score", 0)
 
-        ds_accuracy_total += ds_acc
-        ds_groundedness_total += ds_gnd
-        gm_accuracy_total += gm_acc
-        gm_groundedness_total += gm_gnd
+        ds_acc_total += ds_acc
+        ds_gnd_total += ds_gnd
+        gm_acc_total += gm_acc
+        gm_gnd_total += gm_gnd
 
         winner = judgment.get("winner", "tie")
         if winner == "deepseek":
@@ -215,11 +213,11 @@ def evaluate_long_context(
         else:
             ties += 1
 
-        print(f"    DeepSeek:    accuracy={ds_acc}/5  groundedness={ds_gnd}/5")
-        print(f"    Gemini Flash: accuracy={gm_acc}/5  groundedness={gm_gnd}/5")
-        print(f"    Winner: {winner}")
+        print(f"      DeepSeek    : accuracy={ds_acc}/5  groundedness={ds_gnd}/5")
+        print(f"      Gemini Flash: accuracy={gm_acc}/5  groundedness={gm_gnd}/5")
+        print(f"      Winner: {winner}")
 
-        evaluation["questions"].append({
+        evaluated.append({
             "question_id": q_id,
             "position_percent": q["position_percent"],
             "question": q["question"],
@@ -227,35 +225,140 @@ def evaluate_long_context(
             "judgment": judgment,
         })
 
-    n = len(lc_results["questions"]) or 1
-    evaluation["summary"] = {
+    return evaluated, ds_acc_total, ds_gnd_total, gm_acc_total, gm_gnd_total, ds_wins, gm_wins, ties
+
+
+def _make_tier_summary(ds_acc, ds_gnd, gm_acc, gm_gnd, ds_wins, gm_wins, ties, n: int) -> dict:
+    n = n or 1
+    return {
         "deepseek": {
-            "avg_accuracy": round(ds_accuracy_total / n, 2),
-            "avg_groundedness": round(ds_groundedness_total / n, 2),
-            "total_score": round((ds_accuracy_total + ds_groundedness_total) / (n * 2) * 100, 1),
+            "avg_accuracy": round(ds_acc / n, 2),
+            "avg_groundedness": round(ds_gnd / n, 2),
+            "total_score": round((ds_acc + ds_gnd) / (n * 2) * 100, 1),
             "wins": ds_wins,
         },
         "gemini_flash": {
-            "avg_accuracy": round(gm_accuracy_total / n, 2),
-            "avg_groundedness": round(gm_groundedness_total / n, 2),
-            "total_score": round((gm_accuracy_total + gm_groundedness_total) / (n * 2) * 100, 1),
+            "avg_accuracy": round(gm_acc / n, 2),
+            "avg_groundedness": round(gm_gnd / n, 2),
+            "total_score": round((gm_acc + gm_gnd) / (n * 2) * 100, 1),
             "wins": gm_wins,
         },
         "ties": ties,
-        "overall_winner": "deepseek" if ds_wins > gm_wins else ("gemini_flash" if gm_wins > ds_wins else "tie"),
+        "overall_winner": (
+            "deepseek" if ds_wins > gm_wins else
+            ("gemini_flash" if gm_wins > ds_wins else "tie")
+        ),
+    }
+
+
+def evaluate_long_context(
+    config: Config,
+    judge: GeminiModel,
+    lc_results: dict,
+    results_dir: str,
+) -> dict:
+    """
+    Evaluate long-context results.  Handles both the multi-tier format
+    (lc_results has 'tiers' key) and the legacy single-tier format
+    (lc_results has top-level 'questions' key).
+    """
+    print("\n" + "=" * 70)
+    print("JUDGE: EVALUATING LONG CONTEXT RESULTS")
+    print("=" * 70)
+
+    # Multi-tier path
+    if "tiers" in lc_results:
+        return _evaluate_long_context_tiers(config, judge, lc_results, results_dir)
+
+    # Legacy single-tier path
+    evaluated, ds_acc, ds_gnd, gm_acc, gm_gnd, ds_wins, gm_wins, ties = (
+        _evaluate_questions(judge, lc_results["questions"])
+    )
+    n = len(lc_results["questions"])
+    evaluation = {
+        "part": "long_context_evaluation",
+        "judge_model": config.gemini_pro_model,
+        "questions": evaluated,
+        "summary": _make_tier_summary(ds_acc, ds_gnd, gm_acc, gm_gnd, ds_wins, gm_wins, ties, n),
     }
 
     print(f"\n  LONG CONTEXT SUMMARY:")
-    print(f"    DeepSeek:     avg accuracy={evaluation['summary']['deepseek']['avg_accuracy']}/5, wins={ds_wins}")
-    print(f"    Gemini Flash: avg accuracy={evaluation['summary']['gemini_flash']['avg_accuracy']}/5, wins={gm_wins}")
+    s = evaluation["summary"]
+    print(f"    DeepSeek:     avg accuracy={s['deepseek']['avg_accuracy']}/5, wins={ds_wins}")
+    print(f"    Gemini Flash: avg accuracy={s['gemini_flash']['avg_accuracy']}/5, wins={gm_wins}")
 
-    # Save
     os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, "long_context_evaluation.json")
     with open(out_path, "w") as f:
         json.dump(evaluation, f, indent=2)
     print(f"  Evaluation saved to {out_path}")
+    return evaluation
 
+
+def _evaluate_long_context_tiers(
+    config: Config,
+    judge: GeminiModel,
+    lc_results: dict,
+    results_dir: str,
+) -> dict:
+    """Multi-tier long-context evaluation."""
+    evaluation = {
+        "part": "long_context_evaluation",
+        "judge_model": config.gemini_pro_model,
+        "tiers": {},
+        "overall_summary": {},
+    }
+
+    ds_acc_all = ds_gnd_all = gm_acc_all = gm_gnd_all = 0
+    ds_wins_all = gm_wins_all = ties_all = 0
+    total_q = 0
+
+    for tier_label, tier_data in lc_results["tiers"].items():
+        print(f"\n  --- Tier {tier_label} ---")
+        questions = tier_data.get("questions", [])
+        evaluated, ds_acc, ds_gnd, gm_acc, gm_gnd, ds_wins, gm_wins, ties = (
+            _evaluate_questions(judge, questions)
+        )
+        n = len(questions)
+        tier_summary = _make_tier_summary(
+            ds_acc, ds_gnd, gm_acc, gm_gnd, ds_wins, gm_wins, ties, n
+        )
+        evaluation["tiers"][tier_label] = {
+            "questions": evaluated,
+            "summary": tier_summary,
+        }
+        print(
+            f"  Tier {tier_label} summary — "
+            f"DS avg acc={tier_summary['deepseek']['avg_accuracy']}/5 "
+            f"GM avg acc={tier_summary['gemini_flash']['avg_accuracy']}/5 "
+            f"winner={tier_summary['overall_winner']}"
+        )
+
+        ds_acc_all += ds_acc
+        ds_gnd_all += ds_gnd
+        gm_acc_all += gm_acc
+        gm_gnd_all += gm_gnd
+        ds_wins_all += ds_wins
+        gm_wins_all += gm_wins
+        ties_all += ties
+        total_q += n
+
+    evaluation["overall_summary"] = _make_tier_summary(
+        ds_acc_all, ds_gnd_all, gm_acc_all, gm_gnd_all,
+        ds_wins_all, gm_wins_all, ties_all, total_q,
+    )
+
+    print("\n  OVERALL LONG CONTEXT SUMMARY:")
+    os_ = evaluation["overall_summary"]
+    print(f"    DeepSeek:     avg accuracy={os_['deepseek']['avg_accuracy']}/5, wins={ds_wins_all}")
+    print(f"    Gemini Flash: avg accuracy={os_['gemini_flash']['avg_accuracy']}/5, wins={gm_wins_all}")
+    print(f"    Overall winner: {os_['overall_winner']}")
+
+    os.makedirs(results_dir, exist_ok=True)
+    out_path = os.path.join(results_dir, "long_context_evaluation.json")
+    with open(out_path, "w") as f:
+        json.dump(evaluation, f, indent=2)
+    print(f"  Evaluation saved to {out_path}")
     return evaluation
 
 

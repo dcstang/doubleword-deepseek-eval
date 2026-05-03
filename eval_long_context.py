@@ -1,15 +1,19 @@
 """
-Part 1: Long-context needle-in-a-haystack evaluation.
+Part 1: Long-context needle-in-a-haystack evaluation — multi-tier.
 
 Corpus: numbered clinical notes from AGBonnet/augmented-clinical-notes with 5 needle
 notes planted at specific depth positions (5/25/50/75/95%).
 
-Batch flow (Doubleword delayed, 1h window):
-  1. submit_long_context_batch()  — upload + create batch job, returns batch_id
-  2. <caller runs other work>
-  3. collect_long_context_batch() — polls until done, returns ModelResponse list
+Four context tiers: 200k / 400k / 600k / 800k tokens.  Each tier uses a
+different random seed so the background notes differ between tiers, but both
+models see exactly the same notes at each tier.
 
-Gemini runs synchronously (or concurrently via asyncio fallback).
+Batch flow (Doubleword delayed, 1h window):
+  1. submit_all_tiers_batch()  — upload all 4×5=20 questions, returns batch_id
+  2. <caller runs Gemini + tool-calling while the job queues>
+  3. collect_all_tiers_batch() — polls until done, returns per-tier responses
+
+Gemini runs synchronously per tier (or concurrently via asyncio fallback).
 """
 
 import json
@@ -17,7 +21,14 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 from config import Config
-from medical_texts import NEEDLES, build_corpus_with_needles, estimate_tokens, truncate_to_model_limit
+from medical_texts import (
+    CONTEXT_TIERS,
+    TIER_SEEDS,
+    NEEDLES,
+    build_corpus_with_needles,
+    estimate_tokens,
+    truncate_to_model_limit,
+)
 from models import DeepSeekModel, GeminiModel, ModelResponse
 
 
@@ -39,59 +50,96 @@ QA_PROMPT_TEMPLATE = (
 )
 
 
-def _build_question_list(needles: List[dict], corpus: str) -> List[Dict]:
+def _tier_label(tier: int) -> str:
+    return f"{tier // 1000}k"
+
+
+def _build_tier_question_list(
+    needles: List[dict],
+    corpus: str,
+    tier: int,
+) -> List[Dict]:
+    label = _tier_label(tier)
     return [
         {
-            "id": f"lc-q{n['id']}",
+            "id": f"lc-t{label}-q{n['id']}",
             "prompt": QA_PROMPT_TEMPLATE.format(corpus=corpus, question=n["question"]),
             "needle": n,
+            "tier": tier,
         }
         for n in needles
     ]
 
 
-def prepare_corpora(config: Config) -> Tuple[str, str, str]:
-    """
-    Build and cache the full corpus, then return per-model truncated versions.
-    Returns (full_corpus, deepseek_corpus, gemini_corpus).
-    """
-    print(f"\nBuilding clinical note corpus (target {config.target_context_tokens:,} tokens)...")
-    full_corpus, _ = build_corpus_with_needles(config.target_context_tokens)
+# ---------------------------------------------------------------------------
+# Step 1: build / load corpora for all tiers
+# ---------------------------------------------------------------------------
 
-    ds_corpus = truncate_to_model_limit(full_corpus, config.deepseek_max_context)
-    gm_corpus  = truncate_to_model_limit(full_corpus, config.gemini_max_context)
+def prepare_all_tier_corpora(config: Config) -> Dict[int, Tuple[str, str]]:
+    """
+    Build or load cached corpora for all context tiers.
+    Returns {tier_tokens: (ds_corpus, gm_corpus)}.
+    Each tier uses its own cache file and random seed so content differs.
+    """
+    tier_corpora: Dict[int, Tuple[str, str]] = {}
 
-    print(f"\n  DeepSeek corpus : ~{estimate_tokens(ds_corpus):,} tokens  (limit {config.deepseek_max_context:,})")
-    print(f"  Gemini corpus   : ~{estimate_tokens(gm_corpus):,} tokens  (limit {config.gemini_max_context:,})")
-    return full_corpus, ds_corpus, gm_corpus
+    for tier in CONTEXT_TIERS:
+        seed = TIER_SEEDS[tier]
+        label = _tier_label(tier)
+        print(f"\nBuilding {label} corpus (seed={seed}, target={tier:,} tokens)...")
+
+        full_corpus, _ = build_corpus_with_needles(tier, seed=seed)
+
+        ds_corpus = truncate_to_model_limit(full_corpus, config.deepseek_max_context)
+        gm_corpus = truncate_to_model_limit(full_corpus, config.gemini_max_context)
+
+        print(
+            f"  DeepSeek corpus : ~{estimate_tokens(ds_corpus):,} tokens"
+            f"  (limit {config.deepseek_max_context:,})"
+        )
+        print(
+            f"  Gemini corpus   : ~{estimate_tokens(gm_corpus):,} tokens"
+            f"  (limit {config.gemini_max_context:,})"
+        )
+
+        tier_corpora[tier] = (ds_corpus, gm_corpus)
+
+    return tier_corpora
 
 
 # ---------------------------------------------------------------------------
-# Step 1: submit DeepSeek batch (non-blocking)
+# Step 2a: submit ALL tier questions in one DeepSeek batch (non-blocking)
 # ---------------------------------------------------------------------------
 
-def submit_long_context_batch(
+def submit_all_tiers_batch(
     config: Config,
     deepseek: DeepSeekModel,
-    ds_corpus: str,
+    tier_corpora: Dict[int, Tuple[str, str]],
     results_dir: str,
 ) -> Optional[str]:
     """
-    Submit all 5 long-context questions to the Doubleword delayed batch API
-    (completion_window=1h). Returns the batch_id so the caller can do other
-    work while the job is queued, then call collect_long_context_batch() later.
+    Submit all 4×5=20 long-context questions in a single Doubleword batch
+    (completion_window=1h).  Returns batch_id immediately so the caller can
+    continue with Gemini and tool-calling while the job queues.
 
-    The batch_id is also saved to results/deepseek_batch_id.txt for recovery.
-    Returns None if batch is not enabled (caller should use sync path instead).
+    Returns None if batch mode is disabled (synchronous fallback used later).
     """
     if not config.use_doubleword_batch:
         return None
 
-    ds_questions = _build_question_list(NEEDLES, ds_corpus)
-    print(f"\n  [batch] Submitting {len(ds_questions)} LC questions to Doubleword (1h window)...")
+    all_questions: List[Dict] = []
+    for tier in CONTEXT_TIERS:
+        ds_corpus, _ = tier_corpora[tier]
+        all_questions.extend(_build_tier_question_list(NEEDLES, ds_corpus, tier))
+
+    n_tiers = len(CONTEXT_TIERS)
+    print(
+        f"\n  [batch] Submitting {len(all_questions)} LC questions "
+        f"({n_tiers} tiers × 5) to Doubleword (1h window)..."
+    )
 
     batch_id = deepseek.submit_batch(
-        ds_questions,
+        all_questions,
         system=SYSTEM_PROMPT,
         max_tokens=512,
     )
@@ -102,87 +150,123 @@ def submit_long_context_batch(
         with open(id_path, "w") as f:
             f.write(batch_id)
         print(f"  [batch] Batch job submitted: {batch_id}  (saved to {id_path})")
-        print("  [batch] Continuing with other evaluations — will collect results later.")
+        print("  [batch] Continuing with Gemini + tool-calling — will collect later.")
+
     return batch_id
 
 
 # ---------------------------------------------------------------------------
-# Step 2: run Gemini long-context (sync / concurrent)
+# Step 2b: run Gemini for all tiers (sync per tier, async within tier)
 # ---------------------------------------------------------------------------
 
-def run_gemini_long_context(
+def run_all_gemini_tiers(
     config: Config,
     gemini_flash: GeminiModel,
-    gm_corpus: str,
-) -> List[ModelResponse]:
-    gm_questions = _build_question_list(NEEDLES, gm_corpus)
+    tier_corpora: Dict[int, Tuple[str, str]],
+) -> Dict[int, List[ModelResponse]]:
+    """
+    Run Gemini on all context tiers in sequence.
+    Returns {tier_tokens: [ModelResponse × 5]}.
+    """
+    tier_responses: Dict[int, List[ModelResponse]] = {}
 
-    if config.use_gemini_batch:
-        print(f"\n  Submitting {len(gm_questions)} LC questions to Gemini batch API...")
-        return gemini_flash.batch_chat(
-            gm_questions,
-            system=SYSTEM_PROMPT,
-            max_tokens=512,
-            poll_interval_s=config.batch_poll_interval_s,
+    for tier in CONTEXT_TIERS:
+        _, gm_corpus = tier_corpora[tier]
+        questions = _build_tier_question_list(NEEDLES, gm_corpus, tier)
+        label = _tier_label(tier)
+
+        print(
+            f"\n  Querying {config.gemini_flash_model} — tier {label} "
+            f"({len(questions)} questions)..."
         )
-    else:
-        print(f"\n  Querying {config.gemini_flash_model} for long-context ({len(gm_questions)} questions)...")
-        return gemini_flash.batch_chat(
-            gm_questions,
-            system=SYSTEM_PROMPT,
-            max_tokens=512,
-        )
+
+        if config.use_gemini_batch:
+            responses = gemini_flash.batch_chat(
+                questions,
+                system=SYSTEM_PROMPT,
+                max_tokens=512,
+                poll_interval_s=config.batch_poll_interval_s,
+            )
+        else:
+            responses = gemini_flash.batch_chat(
+                questions,
+                system=SYSTEM_PROMPT,
+                max_tokens=512,
+            )
+
+        tier_responses[tier] = responses
+
+    return tier_responses
 
 
 # ---------------------------------------------------------------------------
-# Step 3: collect DeepSeek batch results (blocking poll or sync fallback)
+# Step 3: collect DeepSeek batch results (or run synchronously)
 # ---------------------------------------------------------------------------
 
-def collect_long_context_batch(
+def collect_all_tiers_batch(
     config: Config,
     deepseek: DeepSeekModel,
-    ds_corpus: str,
+    tier_corpora: Dict[int, Tuple[str, str]],
     batch_id: Optional[str],
     results_dir: str,
-) -> List[ModelResponse]:
+) -> Dict[int, List[ModelResponse]]:
     """
-    If batch_id is given, polls the Doubleword batch API until complete.
-    If batch mode is off, runs synchronously instead.
+    If batch_id given, polls Doubleword until all 20 results are ready.
+    Otherwise runs all questions synchronously.
+    Returns {tier_tokens: [ModelResponse × 5]}.
     """
-    ds_questions = _build_question_list(NEEDLES, ds_corpus)
+    all_questions: List[Dict] = []
+    for tier in CONTEXT_TIERS:
+        ds_corpus, _ = tier_corpora[tier]
+        all_questions.extend(_build_tier_question_list(NEEDLES, ds_corpus, tier))
 
     if batch_id:
-        print(f"\n  [batch] Collecting DeepSeek batch results (id={batch_id})...")
-        return deepseek.collect_batch(
+        print(
+            f"\n  [batch] Collecting {len(all_questions)} DeepSeek LC responses "
+            f"(id={batch_id})..."
+        )
+        all_responses = deepseek.collect_batch(
             batch_id=batch_id,
-            questions=ds_questions,
+            questions=all_questions,
             poll_interval_s=config.batch_poll_interval_s,
         )
     else:
-        print(f"\n  Querying {config.deepseek_model} for long-context (synchronous)...")
-        return [
+        print(
+            f"\n  Querying {config.deepseek_model} synchronously "
+            f"({len(all_questions)} LC questions)..."
+        )
+        all_responses = [
             deepseek.chat(q["prompt"], system=SYSTEM_PROMPT, max_tokens=512)
-            for q in ds_questions
+            for q in all_questions
         ]
+
+    # Split flat list back into per-tier buckets (order preserved from build loop)
+    per_tier = len(NEEDLES)
+    tier_responses: Dict[int, List[ModelResponse]] = {}
+    for i, tier in enumerate(CONTEXT_TIERS):
+        tier_responses[tier] = all_responses[i * per_tier : (i + 1) * per_tier]
+
+    return tier_responses
 
 
 # ---------------------------------------------------------------------------
 # Collate and save results
 # ---------------------------------------------------------------------------
 
-def save_long_context_results(
+def save_all_tier_results(
     config: Config,
-    ds_corpus: str,
-    gm_corpus: str,
-    ds_responses: List[ModelResponse],
-    gm_responses: List[ModelResponse],
+    tier_corpora: Dict[int, Tuple[str, str]],
+    ds_tier_responses: Dict[int, List[ModelResponse]],
+    gm_tier_responses: Dict[int, List[ModelResponse]],
     results_dir: str,
 ) -> dict:
     print("\n" + "=" * 70)
     print("PART 1: LONG CONTEXT — RESULTS SUMMARY")
     print("=" * 70)
 
-    def _fmt(resp: ModelResponse) -> str:
+    def _fmt(resp: Optional[ModelResponse]) -> str:
+        if resp is None:
+            return "[missing]"
         if resp.error:
             return f"[ERROR] {resp.error}"
         return (resp.final_text or "[empty]")[:120]
@@ -191,46 +275,59 @@ def save_long_context_results(
         "part": "long_context",
         "deepseek_model": config.deepseek_model,
         "gemini_flash_model": config.gemini_flash_model,
-        "deepseek_context_tokens": estimate_tokens(ds_corpus),
-        "gemini_context_tokens": estimate_tokens(gm_corpus),
-        "deepseek_batch_mode": ds_responses[0].batch_mode if ds_responses else False,
-        "gemini_batch_mode": gm_responses[0].batch_mode if gm_responses else False,
-        "questions": [],
+        "tiers": {},
     }
 
-    for i, needle in enumerate(NEEDLES):
-        ds_resp = ds_responses[i]
-        gm_resp = gm_responses[i]
+    for tier in CONTEXT_TIERS:
+        label = _tier_label(tier)
+        ds_corpus, gm_corpus = tier_corpora[tier]
+        ds_responses = ds_tier_responses.get(tier, [])
+        gm_responses = gm_tier_responses.get(tier, [])
 
-        print(
-            f"\n  Q{needle['id']} [{needle['position_percent']}%]: {needle['question']}\n"
-            f"    Expected  : {needle['expected_answer']}\n"
-            f"    DeepSeek  : {_fmt(ds_resp)}\n"
-            f"    Gemini    : {_fmt(gm_resp)}"
-        )
+        tier_data: dict = {
+            "tier_tokens": tier,
+            "deepseek_context_tokens": estimate_tokens(ds_corpus),
+            "gemini_context_tokens": estimate_tokens(gm_corpus),
+            "deepseek_batch_mode": ds_responses[0].batch_mode if ds_responses else False,
+            "gemini_batch_mode": gm_responses[0].batch_mode if gm_responses else False,
+            "questions": [],
+        }
 
-        results["questions"].append({
-            "question_id": needle["id"],
-            "position_percent": needle["position_percent"],
-            "question": needle["question"],
-            "expected_answer": needle["expected_answer"],
-            "deepseek": {
-                "answer": ds_resp.final_text,
-                "latency_s": ds_resp.latency_s,
-                "input_tokens": ds_resp.input_tokens,
-                "output_tokens": ds_resp.output_tokens,
-                "batch_mode": ds_resp.batch_mode,
-                "error": ds_resp.error,
-            },
-            "gemini_flash": {
-                "answer": gm_resp.final_text,
-                "latency_s": gm_resp.latency_s,
-                "input_tokens": gm_resp.input_tokens,
-                "output_tokens": gm_resp.output_tokens,
-                "batch_mode": gm_resp.batch_mode,
-                "error": gm_resp.error,
-            },
-        })
+        print(f"\n  --- Tier {label} ---")
+
+        for i, needle in enumerate(NEEDLES):
+            ds_resp = ds_responses[i] if i < len(ds_responses) else None
+            gm_resp = gm_responses[i] if i < len(gm_responses) else None
+
+            print(
+                f"\n  Q{needle['id']} [{needle['position_percent']}%]: {needle['question']}\n"
+                f"    Expected : {needle['expected_answer']}\n"
+                f"    DeepSeek : {_fmt(ds_resp)}\n"
+                f"    Gemini   : {_fmt(gm_resp)}"
+            )
+
+            def _resp_dict(resp: Optional[ModelResponse]) -> Optional[dict]:
+                if resp is None:
+                    return None
+                return {
+                    "answer": resp.final_text,
+                    "latency_s": resp.latency_s,
+                    "input_tokens": resp.input_tokens,
+                    "output_tokens": resp.output_tokens,
+                    "batch_mode": resp.batch_mode,
+                    "error": resp.error,
+                }
+
+            tier_data["questions"].append({
+                "question_id": needle["id"],
+                "position_percent": needle["position_percent"],
+                "question": needle["question"],
+                "expected_answer": needle["expected_answer"],
+                "deepseek": _resp_dict(ds_resp),
+                "gemini_flash": _resp_dict(gm_resp),
+            })
+
+        results["tiers"][label] = tier_data
 
     os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, "long_context_results.json")

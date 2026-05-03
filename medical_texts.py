@@ -11,9 +11,15 @@ Cache: the finished corpus is saved to results/corpus_cache.txt on first build
 """
 
 import os
+import random
 from typing import List, Tuple
 
 CHARS_PER_TOKEN = 4  # rough estimate for English clinical text
+
+CONTEXT_TIERS = [200_000, 400_000, 600_000, 800_000]
+# Different seed per tier so each tier gets a different random sample of notes,
+# but both models are always built from the same seed at each tier.
+TIER_SEEDS = {200_000: 42, 400_000: 137, 600_000: 256, 800_000: 512}
 
 # Needle notes look like real ward notes. Questions target the specific numeric
 # or textual fact buried in each one.
@@ -120,14 +126,21 @@ def _format_note(index: int, text: str) -> str:
     return f"=== NOTE {index} ===\n{text.strip()}\n=== END NOTE ===\n"
 
 
-def fetch_clinical_notes(target_tokens: int, max_notes: int = 50_000) -> List[str]:
+def fetch_clinical_notes(
+    target_tokens: int,
+    seed: int = 0,
+    max_notes: int = 50_000,
+) -> List[str]:
     """
     Stream clinical notes from AGBonnet/augmented-clinical-notes until we have
     roughly target_tokens worth of text.
+
+    seed: when non-zero, shuffles the streaming dataset with a fixed seed so
+          different tiers pull different note samples while remaining reproducible.
     """
     from datasets import load_dataset
 
-    print(f"  Streaming clinical notes (target: {target_tokens:,} tokens)...")
+    print(f"  Streaming clinical notes (target: {target_tokens:,} tokens, seed={seed})...")
 
     dataset = None
     text_field = None
@@ -154,6 +167,8 @@ def fetch_clinical_notes(target_tokens: int, max_notes: int = 50_000) -> List[st
     for dataset_id, field_hint, kwargs in candidates:
         try:
             ds = load_dataset(dataset_id, **kwargs)
+            if seed:
+                ds = ds.shuffle(seed=seed, buffer_size=10_000)
             # Probe the first item to find the text field
             first = next(iter(ds))
             if field_hint and field_hint in first:
@@ -202,7 +217,8 @@ def fetch_clinical_notes(target_tokens: int, max_notes: int = 50_000) -> List[st
 
 def build_corpus_with_needles(
     target_tokens: int,
-    cache_path: str = "results/corpus_cache.txt",
+    seed: int = 0,
+    cache_path: str = None,
 ) -> Tuple[str, List[dict]]:
     """
     Build a corpus of numbered clinical notes with 5 needle notes planted at
@@ -218,7 +234,14 @@ def build_corpus_with_needles(
 
     The finished corpus is cached to cache_path for reproducible re-runs.
     Delete the cache file to force a fresh download.
+
+    cache_path defaults to results/corpus_cache_{target_tokens//1000}k.txt so each
+    tier has its own cache file and won't be overwritten by other tiers.
     """
+    if cache_path is None:
+        label = f"{target_tokens // 1000}k"
+        cache_path = f"results/corpus_cache_{label}.txt"
+
     if os.path.exists(cache_path):
         print(f"  Loading cached corpus from {cache_path}...")
         with open(cache_path, encoding="utf-8") as f:
@@ -226,7 +249,7 @@ def build_corpus_with_needles(
         print(f"  Cached corpus: {len(corpus):,} chars (~{estimate_tokens(corpus):,} tokens)")
         return corpus, NEEDLES
 
-    notes = fetch_clinical_notes(target_tokens)
+    notes = fetch_clinical_notes(target_tokens, seed=seed)
     n_notes = len(notes)
 
     if n_notes == 0:

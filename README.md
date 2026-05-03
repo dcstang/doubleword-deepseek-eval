@@ -7,10 +7,12 @@ Compare **DeepSeek-V4-Flash** (via Doubleword API) against **Gemini 3 Flash** (G
 ## What it tests
 
 ### Part 1 — Long Context (Needle-in-a-Haystack)
-- Streams a medical corpus from HuggingFace (`ccdv/pubmed-summarization`) up to **800k tokens**
+- Streams clinical notes from HuggingFace (`AGBonnet/augmented-clinical-notes`)
+- **Four context tiers**: 200k / 400k / 600k / 800k tokens — each tier uses a different random seed so background notes differ, but both models see the same notes at each tier
 - Truncates to each model's actual context limit (`DEEPSEEK_MAX_CONTEXT`, `GEMINI_MAX_CONTEXT`)
-- Plants **5 specific clinical facts** at depths 5 / 25 / 50 / 75 / 95 % through the corpus
-- Both models answer 5 QA questions; Gemini Pro scores accuracy and groundedness (1–5 each)
+- Plants **5 specific clinical facts** at depths 5 / 25 / 50 / 75 / 95 % through each corpus
+- Both models answer 5 QA questions per tier (20 total); Gemini Pro scores accuracy and groundedness (1–5 each)
+- Corpora cached to `results/corpus_cache_{tier}k.txt` — delete to force fresh download
 
 ### Part 2 — Tool Calling
 Five ICU/emergency clinical scenarios:
@@ -67,7 +69,7 @@ python main.py --skip-long-context --skip-tool-calling --skip-judge
 
 ## Batch / Delayed mode
 
-Doubleword's **delayed API** (`completion_window="1h"`) is enabled by default for long-context queries (`USE_DOUBLEWORD_BATCH=true`). This uses the OpenAI Batch API to submit all 5 QA questions as a single job, reducing cost by ~50%.
+Doubleword's **delayed API** (`completion_window="1h"`) is enabled by default for long-context queries (`USE_DOUBLEWORD_BATCH=true`). This uses the OpenAI Batch API to submit all **20** QA questions (4 tiers × 5 needles) as a single job, reducing cost by ~50%.
 
 Gemini batch (`USE_GEMINI_BATCH=true`) attempts the `google-genai` batch API and falls back to concurrent async requests.
 
@@ -79,12 +81,13 @@ All results are written to `results/`:
 
 | File | Contents |
 |------|---------|
-| `long_context_results.json` | Raw model answers for 5 QA questions |
+| `long_context_results.json` | Raw model answers — 4 tiers × 5 QA questions |
 | `tool_calling_results.json` | Tool calls and responses for 5 scenarios |
-| `long_context_evaluation.json` | Gemini Pro scores for Part 1 |
-| `tool_calling_evaluation.json` | Gemini Pro scores for Part 2 |
+| `long_context_evaluation.json` | Gemini Pro scores per tier for Part 1 |
+| `tool_calling_evaluation.json` | Gemini Pro scores per scenario for Part 2 |
 | `cost_summary.json` | Token usage and estimated USD costs (standard vs batch) |
 | `final_report.md` | Human-readable comparison table and verdict |
+| `corpus_cache_{200k,400k,600k,800k}.txt` | Cached corpora (delete to force re-download) |
 
 ---
 
