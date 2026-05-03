@@ -28,6 +28,9 @@ def run_tool_calling_eval(
     deepseek: DeepSeekModel,
     gemini_flash: GeminiModel,
     results_dir: str,
+    save_suffix: str = "",
+    deepseek_label: str = None,
+    gemini_label: str = None,
 ) -> dict:
     print("\n" + "=" * 70)
     print("PART 2: TOOL CALLING EVALUATION")
@@ -35,8 +38,8 @@ def run_tool_calling_eval(
 
     results = {
         "part": "tool_calling",
-        "deepseek_model": config.deepseek_model,
-        "gemini_flash_model": config.gemini_flash_model,
+        "deepseek_model": deepseek_label or config.deepseek_model,
+        "gemini_flash_model": gemini_label or config.gemini_flash_model,
         "scenarios": [],
     }
 
@@ -120,7 +123,7 @@ def run_tool_calling_eval(
 
     # Save intermediate results
     os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, "tool_calling_results.json")
+    out_path = os.path.join(results_dir, f"tool_calling_results{save_suffix}.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nTool calling results saved to {out_path}")

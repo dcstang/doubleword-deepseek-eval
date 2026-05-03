@@ -58,11 +58,12 @@ def _build_tier_question_list(
     needles: List[dict],
     corpus: str,
     tier: int,
+    q_prefix: str = "lc",
 ) -> List[Dict]:
     label = _tier_label(tier)
     return [
         {
-            "id": f"lc-t{label}-q{n['id']}",
+            "id": f"{q_prefix}-t{label}-q{n['id']}",
             "prompt": QA_PROMPT_TEMPLATE.format(corpus=corpus, question=n["question"]),
             "needle": n,
             "tier": tier,
@@ -116,12 +117,15 @@ def submit_all_tiers_batch(
     deepseek: DeepSeekModel,
     tier_corpora: Dict[int, Tuple[str, str]],
     results_dir: str,
+    q_prefix: str = "lc",
+    batch_id_filename: str = "deepseek_batch_id.txt",
 ) -> Optional[str]:
     """
     Submit all 4×5=20 long-context questions in a single Doubleword batch
-    (completion_window=1h).  Returns batch_id immediately so the caller can
-    continue with Gemini and tool-calling while the job queues.
+    (completion_window=1h).  Returns batch_id immediately.
 
+    q_prefix: prefix for question IDs — use "lc" for Flash, "lc-pro" for Pro.
+    batch_id_filename: file to persist the batch_id for recovery.
     Returns None if batch mode is disabled (synchronous fallback used later).
     """
     if not config.use_doubleword_batch:
@@ -130,12 +134,12 @@ def submit_all_tiers_batch(
     all_questions: List[Dict] = []
     for tier in CONTEXT_TIERS:
         ds_corpus, _ = tier_corpora[tier]
-        all_questions.extend(_build_tier_question_list(NEEDLES, ds_corpus, tier))
+        all_questions.extend(_build_tier_question_list(NEEDLES, ds_corpus, tier, q_prefix))
 
     n_tiers = len(CONTEXT_TIERS)
     print(
         f"\n  [batch] Submitting {len(all_questions)} LC questions "
-        f"({n_tiers} tiers × 5) to Doubleword (1h window)..."
+        f"({n_tiers} tiers × 5, prefix={q_prefix}) to Doubleword (1h window)..."
     )
 
     batch_id = deepseek.submit_batch(
@@ -145,7 +149,7 @@ def submit_all_tiers_batch(
     )
 
     if batch_id:
-        id_path = os.path.join(results_dir, "deepseek_batch_id.txt")
+        id_path = os.path.join(results_dir, batch_id_filename)
         os.makedirs(results_dir, exist_ok=True)
         with open(id_path, "w") as f:
             f.write(batch_id)
@@ -163,6 +167,7 @@ def run_all_gemini_tiers(
     config: Config,
     gemini_flash: GeminiModel,
     tier_corpora: Dict[int, Tuple[str, str]],
+    use_batch: bool = None,   # None → read from config.use_gemini_batch
 ) -> Dict[int, List[ModelResponse]]:
     """
     Run Gemini on all context tiers in sequence.
@@ -180,7 +185,8 @@ def run_all_gemini_tiers(
             f"({len(questions)} questions)..."
         )
 
-        if config.use_gemini_batch:
+        do_batch = config.use_gemini_batch if use_batch is None else use_batch
+        if do_batch:
             responses = gemini_flash.batch_chat(
                 questions,
                 system=SYSTEM_PROMPT,
@@ -209,6 +215,7 @@ def collect_all_tiers_batch(
     tier_corpora: Dict[int, Tuple[str, str]],
     batch_id: Optional[str],
     results_dir: str,
+    q_prefix: str = "lc",
 ) -> Dict[int, List[ModelResponse]]:
     """
     If batch_id given, polls Doubleword until all 20 results are ready.
@@ -218,7 +225,7 @@ def collect_all_tiers_batch(
     all_questions: List[Dict] = []
     for tier in CONTEXT_TIERS:
         ds_corpus, _ = tier_corpora[tier]
-        all_questions.extend(_build_tier_question_list(NEEDLES, ds_corpus, tier))
+        all_questions.extend(_build_tier_question_list(NEEDLES, ds_corpus, tier, q_prefix))
 
     if batch_id:
         print(
@@ -259,6 +266,9 @@ def save_all_tier_results(
     ds_tier_responses: Dict[int, List[ModelResponse]],
     gm_tier_responses: Dict[int, List[ModelResponse]],
     results_dir: str,
+    save_suffix: str = "",
+    deepseek_label: Optional[str] = None,
+    gemini_label: Optional[str] = None,
 ) -> dict:
     print("\n" + "=" * 70)
     print("PART 1: LONG CONTEXT — RESULTS SUMMARY")
@@ -273,8 +283,8 @@ def save_all_tier_results(
 
     results = {
         "part": "long_context",
-        "deepseek_model": config.deepseek_model,
-        "gemini_flash_model": config.gemini_flash_model,
+        "deepseek_model": deepseek_label or config.deepseek_model,
+        "gemini_flash_model": gemini_label or config.gemini_flash_model,
         "tiers": {},
     }
 
@@ -330,7 +340,7 @@ def save_all_tier_results(
         results["tiers"][label] = tier_data
 
     os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, "long_context_results.json")
+    out_path = os.path.join(results_dir, f"long_context_results{save_suffix}.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nLong context results saved to {out_path}")

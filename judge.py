@@ -256,6 +256,7 @@ def evaluate_long_context(
     judge: GeminiModel,
     lc_results: dict,
     results_dir: str,
+    save_suffix: str = "",
 ) -> dict:
     """
     Evaluate long-context results.  Handles both the multi-tier format
@@ -268,7 +269,7 @@ def evaluate_long_context(
 
     # Multi-tier path
     if "tiers" in lc_results:
-        return _evaluate_long_context_tiers(config, judge, lc_results, results_dir)
+        return _evaluate_long_context_tiers(config, judge, lc_results, results_dir, save_suffix)
 
     # Legacy single-tier path
     evaluated, ds_acc, ds_gnd, gm_acc, gm_gnd, ds_wins, gm_wins, ties = (
@@ -288,7 +289,7 @@ def evaluate_long_context(
     print(f"    Gemini Flash: avg accuracy={s['gemini_flash']['avg_accuracy']}/5, wins={gm_wins}")
 
     os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, "long_context_evaluation.json")
+    out_path = os.path.join(results_dir, f"long_context_evaluation{save_suffix}.json")
     with open(out_path, "w") as f:
         json.dump(evaluation, f, indent=2)
     print(f"  Evaluation saved to {out_path}")
@@ -300,6 +301,7 @@ def _evaluate_long_context_tiers(
     judge: GeminiModel,
     lc_results: dict,
     results_dir: str,
+    save_suffix: str = "",
 ) -> dict:
     """Multi-tier long-context evaluation."""
     evaluation = {
@@ -355,7 +357,7 @@ def _evaluate_long_context_tiers(
     print(f"    Overall winner: {os_['overall_winner']}")
 
     os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, "long_context_evaluation.json")
+    out_path = os.path.join(results_dir, f"long_context_evaluation{save_suffix}.json")
     with open(out_path, "w") as f:
         json.dump(evaluation, f, indent=2)
     print(f"  Evaluation saved to {out_path}")
@@ -367,6 +369,7 @@ def evaluate_tool_calling(
     judge: GeminiModel,
     tc_results: dict,
     results_dir: str,
+    save_suffix: str = "",
 ) -> dict:
     print("\n" + "=" * 70)
     print("JUDGE: EVALUATING TOOL CALLING RESULTS")
@@ -473,7 +476,7 @@ def evaluate_tool_calling(
 
     # Save
     os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, "tool_calling_evaluation.json")
+    out_path = os.path.join(results_dir, f"tool_calling_evaluation{save_suffix}.json")
     with open(out_path, "w") as f:
         json.dump(evaluation, f, indent=2)
     print(f"  Evaluation saved to {out_path}")
