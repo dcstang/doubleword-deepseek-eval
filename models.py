@@ -415,9 +415,7 @@ class GeminiModel:
                 model=self.model,
                 content=types.Content(
                     role="user",
-                    parts=[types.Part.from_text(
-                        f"[SYSTEM]: {system}\n\n{q['prompt']}"
-                    )],
+                    parts=[types.Part(text=f"[SYSTEM]: {system}\n\n{q['prompt']}")],
                 ),
             )
             for q in questions
@@ -541,7 +539,7 @@ class GeminiModel:
             tools=gemini_tools,
         )
 
-        contents = [types.Content(role="user", parts=[types.Part.from_text(prompt)])]
+        contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
         tool_calls_log: List[ToolCall] = []
         total_input = total_output = 0
         start = time.time()
@@ -578,9 +576,11 @@ class GeminiModel:
                     result = execute_tool(fc.name, args)
                     tool_calls_log.append(ToolCall(name=fc.name, arguments=args, result=result))
                     response_parts.append(
-                        types.Part.from_function_response(
-                            name=fc.name,
-                            response={"result": json.dumps(result)},
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name=fc.name,
+                                response={"result": json.dumps(result)},
+                            )
                         )
                     )
                 contents.append(types.Content(role="user", parts=response_parts))

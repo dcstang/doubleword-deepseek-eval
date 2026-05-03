@@ -120,11 +120,17 @@ def run_long_context_eval(
     for i, needle in enumerate(needles):
         ds_resp = ds_responses[i]
         gm_resp = gm_responses[i]
+
+        def _fmt(resp) -> str:
+            if resp.error:
+                return f"[ERROR] {resp.error}"
+            return (resp.final_text or "[empty]")[:120]
+
         print(
             f"\n  Q{needle['id']} [{needle['position_percent']}%]: {needle['question']}\n"
             f"    Expected  : {needle['expected_answer']}\n"
-            f"    DeepSeek  : {(ds_resp.final_text or '[ERROR]')[:120]}\n"
-            f"    Gemini    : {(gm_resp.final_text or '[ERROR]')[:120]}"
+            f"    DeepSeek  : {_fmt(ds_resp)}\n"
+            f"    Gemini    : {_fmt(gm_resp)}"
         )
         results["questions"].append({
             "question_id": needle["id"],

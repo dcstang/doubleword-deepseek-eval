@@ -4,6 +4,7 @@ long context evaluation. Needles are specific clinical facts planted at fixed pe
 positions throughout the corpus.
 """
 
+import os
 from typing import List, Tuple
 
 CHARS_PER_TOKEN = 4  # rough estimate for English medical text
@@ -135,11 +136,26 @@ def fetch_medical_corpus(target_tokens: int, max_articles: int = 10000) -> List[
     return articles
 
 
-def build_corpus_with_needles(target_tokens: int) -> Tuple[str, List[dict]]:
+def build_corpus_with_needles(
+    target_tokens: int,
+    cache_path: str = "results/corpus_cache.txt",
+) -> Tuple[str, List[dict]]:
     """
     Build a single long medical text corpus with NEEDLES planted at specific
     percentage depths. Returns (corpus_text, needles_list).
+
+    The finished corpus (with needles already inserted) is cached to disk so
+    subsequent runs skip the HuggingFace download entirely.
     """
+    import os
+
+    if os.path.exists(cache_path):
+        print(f"  Loading cached corpus from {cache_path}...")
+        with open(cache_path, encoding="utf-8") as f:
+            corpus = f.read()
+        print(f"  Cached corpus: {len(corpus):,} chars (~{estimate_tokens(corpus):,} tokens)")
+        return corpus, NEEDLES
+
     articles = fetch_medical_corpus(target_tokens)
     base = "\n\n---\n\n".join(articles)
 
@@ -177,6 +193,13 @@ def build_corpus_with_needles(target_tokens: int) -> Tuple[str, List[dict]]:
 
     final_tokens = estimate_tokens(corpus)
     print(f"  Final corpus with needles: {len(corpus):,} chars (~{final_tokens:,} tokens)")
+
+    # Cache to disk for reproducibility and faster re-runs
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        f.write(corpus)
+    print(f"  Corpus cached to {cache_path}")
+
     return corpus, NEEDLES
 
 
