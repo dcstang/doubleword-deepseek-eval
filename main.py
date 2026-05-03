@@ -55,12 +55,16 @@ def compute_cost_summary(
     tc_results: dict,
     lc_eval: dict,
     tc_eval: dict,
+    lc_results_pro: dict = None,
+    tc_results_pro: dict = None,
 ) -> dict:
     """Aggregate token usage and compute estimated costs with/without batch discount."""
 
     def tally(results_part: dict, model_key: str):
         inp = out = 0
         batch = False
+        if results_part is None:
+            return inp, out, batch
         # Multi-tier long-context format: tiers -> {label -> {questions: [...]}}
         if "tiers" in results_part:
             for tier_data in results_part["tiers"].values():
@@ -92,65 +96,57 @@ def compute_cost_summary(
     gm_lc_in,  gm_lc_out,  gm_lc_batch  = tally(lc_results, "gemini_flash")
     gm_tc_in,  gm_tc_out,  _            = tally(tc_results, "gemini_flash")
 
-    ds_total_in  = ds_lc_in  + ds_tc_in
-    ds_total_out = ds_lc_out + ds_tc_out
-    gm_total_in  = gm_lc_in  + gm_tc_in
-    gm_total_out = gm_lc_out + gm_tc_out
+    dsp_lc_in, dsp_lc_out, dsp_lc_batch = tally(lc_results_pro, "deepseek")
+    dsp_tc_in, dsp_tc_out, _            = tally(tc_results_pro, "deepseek")
+    gmp_lc_in, gmp_lc_out, gmp_lc_batch = tally(lc_results_pro, "gemini_flash")
+    gmp_tc_in, gmp_tc_out, _            = tally(tc_results_pro, "gemini_flash")
 
-    p_ds = config.deepseek_pricing
-    p_gm = config.gemini_flash_pricing
-    p_pro = config.gemini_pro_pricing
+    p_ds  = config.deepseek_pricing
+    p_gm  = config.gemini_flash_pricing
+    p_dsp = config.deepseek_pro_pricing
+    p_gmp = config.gemini_eval_pro_pricing
+    p_judge = config.gemini_pro_pricing
 
-    # DeepSeek: long-context questions in batch, tool-calling sync
-    ds_cost_standard = p_ds.cost(ds_total_in, ds_total_out, batch=False)
-    ds_lc_cost_batch = p_ds.cost(ds_lc_in, ds_lc_out, batch=True) if ds_lc_batch else p_ds.cost(ds_lc_in, ds_lc_out, batch=False)
-    ds_tc_cost       = p_ds.cost(ds_tc_in, ds_tc_out, batch=False)
-    ds_cost_actual   = ds_lc_cost_batch + ds_tc_cost
+    def _model_cost_block(p, lc_in, lc_out, lc_batch, tc_in, tc_out, model_name):
+        total_in  = lc_in  + tc_in
+        total_out = lc_out + tc_out
+        standard  = p.cost(total_in, total_out, batch=False)
+        lc_actual = p.cost(lc_in, lc_out, batch=lc_batch)
+        tc_actual = p.cost(tc_in, tc_out, batch=False)
+        actual    = lc_actual + tc_actual
+        return {
+            "model": model_name,
+            "total_input_tokens": total_in,
+            "total_output_tokens": total_out,
+            "long_context_batch_mode": lc_batch,
+            "cost_standard_usd": round(standard, 4),
+            "cost_actual_usd":   round(actual, 4),
+            "savings_usd":       round(standard - actual, 4),
+            "pricing": {
+                "input_per_million":   p.input_per_million,
+                "output_per_million":  p.output_per_million,
+                "batch_discount_pct":  int(p.batch_discount * 100),
+            },
+        }
 
-    # Gemini Flash: long-context in batch if enabled, tool-calling sync
-    gm_cost_standard = p_gm.cost(gm_total_in, gm_total_out, batch=False)
-    gm_lc_cost_batch = p_gm.cost(gm_lc_in, gm_lc_out, batch=True) if gm_lc_batch else p_gm.cost(gm_lc_in, gm_lc_out, batch=False)
-    gm_tc_cost       = p_gm.cost(gm_tc_in, gm_tc_out, batch=False)
-    gm_cost_actual   = gm_lc_cost_batch + gm_tc_cost
+    # Judge: ~2k in / 0.5k out per judgment × 10 judgments (×2 if pro run)
+    n_judge_sets = 2 if lc_results_pro else 1
+    judge_in_est  = n_judge_sets * 10 * 2000
+    judge_out_est = n_judge_sets * 10 * 500
+    judge_cost    = p_judge.cost(judge_in_est, judge_out_est)
 
-    # Judge (Gemini Pro — rough estimate: assume ~2k in / 0.5k out per judgment, 10 judgments)
-    judge_in_est  = 10 * 2000
-    judge_out_est = 10 * 500
-    judge_cost    = p_pro.cost(judge_in_est, judge_out_est)
+    ds_block  = _model_cost_block(p_ds,  ds_lc_in,  ds_lc_out,  ds_lc_batch,  ds_tc_in,  ds_tc_out,  config.deepseek_model)
+    gm_block  = _model_cost_block(p_gm,  gm_lc_in,  gm_lc_out,  gm_lc_batch,  gm_tc_in,  gm_tc_out,  config.gemini_flash_model)
+    dsp_block = _model_cost_block(p_dsp, dsp_lc_in, dsp_lc_out, dsp_lc_batch, dsp_tc_in, dsp_tc_out, config.deepseek_pro_model or "")
+    gmp_block = _model_cost_block(p_gmp, gmp_lc_in, gmp_lc_out, gmp_lc_batch, gmp_tc_in, gmp_tc_out, config.gemini_eval_pro_model or "")
 
-    total_standard = ds_cost_standard + gm_cost_standard + judge_cost
-    total_actual   = ds_cost_actual   + gm_cost_actual   + judge_cost
+    total_standard = sum(b["cost_standard_usd"] for b in [ds_block, gm_block, dsp_block, gmp_block]) + judge_cost
+    total_actual   = sum(b["cost_actual_usd"]   for b in [ds_block, gm_block, dsp_block, gmp_block]) + judge_cost
     savings        = total_standard - total_actual
 
-    return {
-        "deepseek": {
-            "model": config.deepseek_model,
-            "total_input_tokens": ds_total_in,
-            "total_output_tokens": ds_total_out,
-            "long_context_batch_mode": ds_lc_batch,
-            "cost_standard_usd": round(ds_cost_standard, 4),
-            "cost_actual_usd": round(ds_cost_actual, 4),
-            "savings_usd": round(ds_cost_standard - ds_cost_actual, 4),
-            "pricing": {
-                "input_per_million": p_ds.input_per_million,
-                "output_per_million": p_ds.output_per_million,
-                "batch_discount_pct": int(p_ds.batch_discount * 100),
-            },
-        },
-        "gemini_flash": {
-            "model": config.gemini_flash_model,
-            "total_input_tokens": gm_total_in,
-            "total_output_tokens": gm_total_out,
-            "long_context_batch_mode": gm_lc_batch,
-            "cost_standard_usd": round(gm_cost_standard, 4),
-            "cost_actual_usd": round(gm_cost_actual, 4),
-            "savings_usd": round(gm_cost_standard - gm_cost_actual, 4),
-            "pricing": {
-                "input_per_million": p_gm.input_per_million,
-                "output_per_million": p_gm.output_per_million,
-                "batch_discount_pct": int(p_gm.batch_discount * 100),
-            },
-        },
+    out = {
+        "deepseek_flash": ds_block,
+        "gemini_flash":   gm_block,
         "judge_gemini_pro": {
             "model": config.gemini_pro_model,
             "estimated_input_tokens": judge_in_est,
@@ -165,6 +161,10 @@ def compute_cost_summary(
         },
         "note": "Pricing estimates — verify at doubleword.ai and ai.google.dev/pricing",
     }
+    if lc_results_pro:
+        out["deepseek_pro"]      = dsp_block
+        out["gemini_eval_pro"]   = gmp_block
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +179,10 @@ def write_report(
     tc_eval: dict,
     cost_summary: dict,
     results_dir: str,
+    lc_results_pro: dict = None,
+    tc_results_pro: dict = None,
+    lc_eval_pro: dict = None,
+    tc_eval_pro: dict = None,
 ) -> str:
     # Multi-tier uses overall_summary; legacy single-tier uses summary
     lc_overall = lc_eval.get("overall_summary", lc_eval.get("summary", {}))
@@ -188,8 +192,14 @@ def write_report(
     ds_tc = tc_sum.get("deepseek", {})
     gm_tc = tc_sum.get("gemini_flash", {})
 
-    ds_cost = cost_summary["deepseek"]
-    gm_cost = cost_summary["gemini_flash"]
+    has_pro = bool(lc_results_pro or tc_results_pro)
+    lc_overall_pro = (lc_eval_pro or {}).get("overall_summary", (lc_eval_pro or {}).get("summary", {}))
+    tc_sum_pro     = (tc_eval_pro or {}).get("summary", {})
+    dsp_lc = lc_overall_pro.get("deepseek", {})
+    gmp_lc = lc_overall_pro.get("gemini_flash", {})
+    dsp_tc = tc_sum_pro.get("deepseek", {})
+    gmp_tc = tc_sum_pro.get("gemini_flash", {})
+
     totals  = cost_summary["totals"]
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -302,42 +312,72 @@ def write_report(
             f"| **{winner}** |"
         )
 
+    ds_flash_label  = lc_results.get("deepseek_model", config.deepseek_model)
+    gm_flash_label  = lc_results.get("gemini_flash_model", config.gemini_flash_model)
+    ds_pro_label    = (lc_results_pro or {}).get("deepseek_model", config.deepseek_pro_model or "DS Pro")
+    gm_pro_label    = (lc_results_pro or {}).get("gemini_flash_model", config.gemini_eval_pro_model or "GM Pro")
+
+    tc_hdr = "| # | Scenario | DS-F Tool | DS-F Param | DS-F Clin | GM-F Tool | GM-F Param | GM-F Clin |"
+    tc_sep = "|---|----------|:---:|:---:|:---:|:---:|:---:|:---:|"
+    if has_pro:
+        tc_hdr += " DSP Tool | DSP Param | DSP Clin | GMP Tool | GMP Param | GMP Clin | "
+        tc_sep += ":---:|:---:|:---:|:---:|:---:|:---:|"
+    tc_hdr += " Winner |"
+    tc_sep += ":---:|"
+
+    tc_pro_scenarios = {s["scenario_id"]: s for s in (tc_eval_pro or {}).get("scenarios", [])}
+
     lines += [
         "",
         "### Tool Calling Summary",
         f"| Model | Avg Tool Sel | Avg Params | Avg Clinical | Score | Wins |",
         f"|-------|:---:|:---:|:---:|:---:|:---:|",
-        f"| DeepSeek-V4-Flash | {ds_tc.get('avg_tool_selection','?')}/3 | {ds_tc.get('avg_parameter_accuracy','?')}/3 | {ds_tc.get('avg_clinical_reasoning','?')}/4 | {ds_tc.get('total_score','?')}% | {ds_tc.get('wins','?')} |",
-        f"| Gemini 3 Flash    | {gm_tc.get('avg_tool_selection','?')}/3 | {gm_tc.get('avg_parameter_accuracy','?')}/3 | {gm_tc.get('avg_clinical_reasoning','?')}/4 | {gm_tc.get('total_score','?')}% | {gm_tc.get('wins','?')} |",
+        f"| {ds_flash_label} | {ds_tc.get('avg_tool_selection','?')}/3 | {ds_tc.get('avg_parameter_accuracy','?')}/3 | {ds_tc.get('avg_clinical_reasoning','?')}/4 | {ds_tc.get('total_score','?')}% | {ds_tc.get('wins','?')} |",
+        f"| {gm_flash_label} | {gm_tc.get('avg_tool_selection','?')}/3 | {gm_tc.get('avg_parameter_accuracy','?')}/3 | {gm_tc.get('avg_clinical_reasoning','?')}/4 | {gm_tc.get('total_score','?')}% | {gm_tc.get('wins','?')} |",
+    ]
+    if has_pro:
+        lines += [
+            f"| {ds_pro_label} | {dsp_tc.get('avg_tool_selection','?')}/3 | {dsp_tc.get('avg_parameter_accuracy','?')}/3 | {dsp_tc.get('avg_clinical_reasoning','?')}/4 | {dsp_tc.get('total_score','?')}% | {dsp_tc.get('wins','?')} |",
+            f"| {gm_pro_label} | {gmp_tc.get('avg_tool_selection','?')}/3 | {gmp_tc.get('avg_parameter_accuracy','?')}/3 | {gmp_tc.get('avg_clinical_reasoning','?')}/4 | {gmp_tc.get('total_score','?')}% | {gmp_tc.get('wins','?')} |",
+        ]
+    lines += [
         "",
-        f"**Tool calling winner: {tc_sum.get('overall_winner', '?').upper()}**",
+        f"**Tool calling winner (Flash): {tc_sum.get('overall_winner', '?').upper()}**",
+    ]
+    if has_pro:
+        lines.append(f"**Tool calling winner (Pro): {tc_sum_pro.get('overall_winner', '?').upper()}**")
+    lines += [
         "",
         "---",
         "",
         "## Cost Comparison",
         "",
-        "### Token Usage",
-        f"| Model | Input Tokens | Output Tokens |",
-        f"|-------|:---:|:---:|",
-        f"| {config.deepseek_model} | {ds_cost['total_input_tokens']:,} | {ds_cost['total_output_tokens']:,} |",
-        f"| {config.gemini_flash_model} | {gm_cost['total_input_tokens']:,} | {gm_cost['total_output_tokens']:,} |",
+    ]
+
+    # Cost rows for all active models
+    ds_block  = cost_summary.get("deepseek_flash", {})
+    gm_block  = cost_summary.get("gemini_flash", {})
+    dsp_block = cost_summary.get("deepseek_pro", {})
+    gmp_block = cost_summary.get("gemini_eval_pro", {})
+
+    cost_rows = [
+        f"| {ds_flash_label} | {ds_block.get('total_input_tokens',0):,} | {ds_block.get('total_output_tokens',0):,} | ${ds_block.get('cost_standard_usd',0):.4f} | ${ds_block.get('cost_actual_usd',0):.4f} | ${ds_block.get('savings_usd',0):.4f} | {ds_block.get('long_context_batch_mode',False)} |",
+        f"| {gm_flash_label} | {gm_block.get('total_input_tokens',0):,} | {gm_block.get('total_output_tokens',0):,} | ${gm_block.get('cost_standard_usd',0):.4f} | ${gm_block.get('cost_actual_usd',0):.4f} | ${gm_block.get('savings_usd',0):.4f} | {gm_block.get('long_context_batch_mode',False)} |",
+    ]
+    if has_pro and dsp_block:
+        cost_rows.append(f"| {ds_pro_label} | {dsp_block.get('total_input_tokens',0):,} | {dsp_block.get('total_output_tokens',0):,} | ${dsp_block.get('cost_standard_usd',0):.4f} | ${dsp_block.get('cost_actual_usd',0):.4f} | ${dsp_block.get('savings_usd',0):.4f} | {dsp_block.get('long_context_batch_mode',False)} |")
+    if has_pro and gmp_block:
+        cost_rows.append(f"| {gm_pro_label} | {gmp_block.get('total_input_tokens',0):,} | {gmp_block.get('total_output_tokens',0):,} | ${gmp_block.get('cost_standard_usd',0):.4f} | ${gmp_block.get('cost_actual_usd',0):.4f} | ${gmp_block.get('savings_usd',0):.4f} | {gmp_block.get('long_context_batch_mode',False)} |")
+
+    lines += [
+        "| Model | Input Tokens | Output Tokens | Without Batch | With Batch | Savings | Batch? |",
+        "|-------|:---:|:---:|:---:|:---:|:---:|:---:|",
+        *cost_rows,
+        f"| Gemini Pro (judge) | — | — | — | ${cost_summary['judge_gemini_pro']['estimated_cost_usd']:.4f} | — | no |",
+        f"| **Total** | | | **${totals['cost_without_batch_usd']:.4f}** | **${totals['cost_with_batch_usd']:.4f}** | **${totals['batch_savings_usd']:.4f} ({totals['batch_savings_pct']}%)** | |",
         "",
-        "### Estimated Cost (USD)",
-        f"| Model | Without Batch | With Batch/Delayed | Savings | Batch Mode Used |",
-        f"|-------|:---:|:---:|:---:|:---:|",
-        f"| DeepSeek-V4-Flash | ${ds_cost['cost_standard_usd']:.4f} | ${ds_cost['cost_actual_usd']:.4f} | ${ds_cost['savings_usd']:.4f} | {ds_cost['long_context_batch_mode']} |",
-        f"| Gemini 3 Flash    | ${gm_cost['cost_standard_usd']:.4f} | ${gm_cost['cost_actual_usd']:.4f} | ${gm_cost['savings_usd']:.4f} | {gm_cost['long_context_batch_mode']} |",
-        f"| Gemini 3 Pro (judge) | — | ${cost_summary['judge_gemini_pro']['estimated_cost_usd']:.4f} | — | no |",
-        f"| **Total** | **${totals['cost_without_batch_usd']:.4f}** | **${totals['cost_with_batch_usd']:.4f}** | **${totals['batch_savings_usd']:.4f} ({totals['batch_savings_pct']}%)** | |",
-        "",
-        "> Pricing estimates — verify current rates at doubleword.ai and ai.google.dev/pricing.",
-        "> Doubleword delayed batch (1h window) = 50% discount on long-context queries.",
-        "",
-        "### Pricing Config Used",
-        f"| Model | Input $/M | Output $/M | Batch Discount |",
-        f"|-------|:---:|:---:|:---:|",
-        f"| DeepSeek (Doubleword) | ${ds_cost['pricing']['input_per_million']} | ${ds_cost['pricing']['output_per_million']} | {ds_cost['pricing']['batch_discount_pct']}% |",
-        f"| Gemini 3 Flash | ${gm_cost['pricing']['input_per_million']} | ${gm_cost['pricing']['output_per_million']} | {gm_cost['pricing']['batch_discount_pct']}% |",
+        "> Pricing: doubleword.ai (DeepSeek) · ai.google.dev/pricing (Gemini)",
+        "> Doubleword delayed batch (1h window): 50% off. Gemini 3.1 Pro Preview: ≤200k $1/$6, >200k $2/$9 per 1M tokens.",
         "",
         "---",
         "",
@@ -346,23 +386,46 @@ def write_report(
 
     ds_total_wins = ds_lc.get("wins", 0) + ds_tc.get("wins", 0)
     gm_total_wins = gm_lc.get("wins", 0) + gm_tc.get("wins", 0)
-    overall = (
-        "DeepSeek-V4-Flash" if ds_total_wins > gm_total_wins else
-        ("Gemini 3 Flash" if gm_total_wins > ds_total_wins else "Tie")
+    overall_flash = (
+        ds_flash_label if ds_total_wins > gm_total_wins else
+        (gm_flash_label if gm_total_wins > ds_total_wins else "Tie")
     )
 
     lines += [
-        f"| Dimension | DeepSeek-V4-Flash | Gemini 3 Flash |",
-        f"|-----------|:-----------------:|:--------------:|",
-        f"| Long Context Score | {ds_lc.get('total_score', '?')}% | {gm_lc.get('total_score', '?')}% |",
-        f"| Tool Calling Score | {ds_tc.get('total_score', '?')}% | {gm_tc.get('total_score', '?')}% |",
+        f"| Dimension | {ds_flash_label} | {gm_flash_label} |",
+        f"|-----------|:---:|:---:|",
+        f"| Long Context Score | {ds_lc.get('total_score','?')}% | {gm_lc.get('total_score','?')}% |",
+        f"| Tool Calling Score | {ds_tc.get('total_score','?')}% | {gm_tc.get('total_score','?')}% |",
         f"| Total Wins | {ds_total_wins} | {gm_total_wins} |",
-        f"| Estimated Cost (batch) | ${ds_cost['cost_actual_usd']:.4f} | ${gm_cost['cost_actual_usd']:.4f} |",
+        f"| Cost (batch) | ${ds_block.get('cost_actual_usd',0):.4f} | ${gm_block.get('cost_actual_usd',0):.4f} |",
         "",
-        f"### **Overall winner: {overall}**",
+        f"### **Flash winner: {overall_flash}**",
+    ]
+
+    if has_pro:
+        dsp_total = dsp_lc.get("wins", 0) + dsp_tc.get("wins", 0)
+        gmp_total = gmp_lc.get("wins", 0) + gmp_tc.get("wins", 0)
+        overall_pro = (
+            ds_pro_label if dsp_total > gmp_total else
+            (gm_pro_label if gmp_total > dsp_total else "Tie")
+        )
+        lines += [
+            "",
+            f"| Dimension | {ds_pro_label} | {gm_pro_label} |",
+            f"|-----------|:---:|:---:|",
+            f"| Long Context Score | {dsp_lc.get('total_score','?')}% | {gmp_lc.get('total_score','?')}% |",
+            f"| Tool Calling Score | {dsp_tc.get('total_score','?')}% | {gmp_tc.get('total_score','?')}% |",
+            f"| Total Wins | {dsp_total} | {gmp_total} |",
+            f"| Cost (batch) | ${dsp_block.get('cost_actual_usd',0):.4f} | ${gmp_block.get('cost_actual_usd',0):.4f} |",
+            "",
+            f"### **Pro winner: {overall_pro}**",
+        ]
+
+    lines += [
         "",
         "---",
-        "*Results are in `results/` directory. Raw model outputs: `long_context_results.json`, `tool_calling_results.json`. Judge scores: `long_context_evaluation.json`, `tool_calling_evaluation.json`.*",
+        "*Results in `results/`. Flash: `long_context_results.json`, `tool_calling_results.json`. "
+        "Pro: `long_context_results_pro.json`, `tool_calling_results_pro.json`.*",
     ]
 
     report = "\n".join(lines)
@@ -384,6 +447,8 @@ def parse_args():
     p.add_argument("--skip-tool-calling",  action="store_true", help="Skip Part 2 (load from results/ if available)")
     p.add_argument("--skip-judge",         action="store_true", help="Skip judge evaluation")
     p.add_argument("--skip-report",        action="store_true", help="Skip final report generation")
+    p.add_argument("--include-pro",        action="store_true",
+                   help="Also run Pro models (DEEPSEEK_PRO_MODEL + GEMINI_EVAL_PRO_MODEL) and add a 4-way comparison to the report")
     return p.parse_args()
 
 
@@ -549,6 +614,77 @@ def main():
             config.results_dir,
         )
 
+    # ── Optional Pro model run ────────────────────────────────────────────────
+    lc_results_pro = tc_results_pro = lc_eval_pro = tc_eval_pro = None
+    lc_path_pro = os.path.join(config.results_dir, "long_context_results_pro.json")
+    tc_path_pro = os.path.join(config.results_dir, "tool_calling_results_pro.json")
+
+    run_pro = args.include_pro and (config.deepseek_pro_model or config.gemini_eval_pro_model)
+    if args.include_pro and not run_pro:
+        print("\n[pro] --include-pro set but neither DEEPSEEK_PRO_MODEL nor GEMINI_EVAL_PRO_MODEL is configured. Skipping.")
+
+    if run_pro:
+        print("\n" + "=" * 70)
+        print("PRO MODEL COMPARISON")
+        print("=" * 70)
+
+        deepseek_pro   = DeepSeekModel(config.doubleword_api_key, config.doubleword_base_url,
+                                       config.deepseek_pro_model) if config.deepseek_pro_model else deepseek
+        gemini_eval_pro = GeminiModel(config.gemini_api_key,
+                                      config.gemini_eval_pro_model) if config.gemini_eval_pro_model else gemini_flash
+
+        print(f"  DeepSeek Pro : {config.deepseek_pro_model or '(same as flash)'}")
+        print(f"  Gemini Pro   : {config.gemini_eval_pro_model or '(same as flash)'}")
+
+        if args.skip_long_context:
+            lc_results_pro = load_json_if_exists(lc_path_pro)
+            if lc_results_pro:
+                print(f"\n[skip] Loaded pro LC results from {lc_path_pro}")
+        else:
+            # Ensure corpora are built (may already be done from flash run)
+            if tier_corpora is None:
+                tier_corpora = prepare_all_tier_corpora(config)
+
+            # Submit DeepSeek Pro batch (24h window — same API, completion_window="1h")
+            ds_pro_batch_id = submit_all_tiers_batch(
+                config, deepseek_pro, tier_corpora, config.results_dir,
+                q_prefix="lc-pro", batch_id_filename="deepseek_pro_batch_id.txt",
+            )
+
+            # Run Gemini Pro tiers (use pro batch setting)
+            gm_pro_tier_responses = run_all_gemini_tiers(
+                config, gemini_eval_pro, tier_corpora,
+                use_batch=config.use_gemini_pro_batch,
+            )
+
+            # Collect DeepSeek Pro batch
+            ds_pro_tier_responses = collect_all_tiers_batch(
+                config, deepseek_pro, tier_corpora, ds_pro_batch_id,
+                config.results_dir, q_prefix="lc-pro",
+            )
+
+            lc_results_pro = save_all_tier_results(
+                config, tier_corpora,
+                ds_pro_tier_responses, gm_pro_tier_responses,
+                config.results_dir,
+                save_suffix="_pro",
+                deepseek_label=config.deepseek_pro_model,
+                gemini_label=config.gemini_eval_pro_model,
+            )
+
+        if args.skip_tool_calling:
+            tc_results_pro = load_json_if_exists(tc_path_pro)
+            if tc_results_pro:
+                print(f"\n[skip] Loaded pro TC results from {tc_path_pro}")
+        if tc_results_pro is None:
+            tc_results_pro = run_tool_calling_eval(
+                config, deepseek_pro, gemini_eval_pro, config.results_dir,
+                save_suffix="_pro",
+                deepseek_label=config.deepseek_pro_model,
+                gemini_label=config.gemini_eval_pro_model,
+            )
+
+
     # ── Judge ─────────────────────────────────────────────────────────────────
     lc_eval_path = os.path.join(config.results_dir, "long_context_evaluation.json")
     tc_eval_path = os.path.join(config.results_dir, "tool_calling_evaluation.json")
@@ -556,13 +692,23 @@ def main():
     if args.skip_judge:
         lc_eval = load_json_if_exists(lc_eval_path) or {}
         tc_eval = load_json_if_exists(tc_eval_path) or {}
+        if run_pro:
+            lc_eval_pro = load_json_if_exists(os.path.join(config.results_dir, "long_context_evaluation_pro.json")) or {}
+            tc_eval_pro = load_json_if_exists(os.path.join(config.results_dir, "tool_calling_evaluation_pro.json")) or {}
         print(f"\n[skip] Loaded judge evaluations from {config.results_dir}/")
     else:
         lc_eval = evaluate_long_context(config, gemini_pro, lc_results, config.results_dir)
         tc_eval = evaluate_tool_calling(config, gemini_pro, tc_results, config.results_dir)
+        if run_pro and lc_results_pro:
+            lc_eval_pro = evaluate_long_context(config, gemini_pro, lc_results_pro, config.results_dir, save_suffix="_pro")
+        if run_pro and tc_results_pro:
+            tc_eval_pro = evaluate_tool_calling(config, gemini_pro, tc_results_pro, config.results_dir, save_suffix="_pro")
 
     # ── Cost summary ──────────────────────────────────────────────────────────
-    cost_summary = compute_cost_summary(config, lc_results, tc_results, lc_eval, tc_eval)
+    cost_summary = compute_cost_summary(
+        config, lc_results, tc_results, lc_eval, tc_eval,
+        lc_results_pro, tc_results_pro,
+    )
     cost_path = os.path.join(config.results_dir, "cost_summary.json")
     with open(cost_path, "w") as f:
         json.dump(cost_summary, f, indent=2)
@@ -570,16 +716,14 @@ def main():
     print("\n" + "=" * 70)
     print("COST SUMMARY")
     print("=" * 70)
-    ds_c = cost_summary["deepseek"]
-    gm_c = cost_summary["gemini_flash"]
     totals = cost_summary["totals"]
-    print(f"  DeepSeek-V4-Flash : {ds_c['total_input_tokens']:,} in / {ds_c['total_output_tokens']:,} out "
-          f"→ ${ds_c['cost_standard_usd']:.4f} standard | ${ds_c['cost_actual_usd']:.4f} batch "
-          f"(saves ${ds_c['savings_usd']:.4f})")
-    print(f"  Gemini 3 Flash    : {gm_c['total_input_tokens']:,} in / {gm_c['total_output_tokens']:,} out "
-          f"→ ${gm_c['cost_standard_usd']:.4f} standard | ${gm_c['cost_actual_usd']:.4f} batch "
-          f"(saves ${gm_c['savings_usd']:.4f})")
-    print(f"  Gemini 3 Pro (judge) : ~${cost_summary['judge_gemini_pro']['estimated_cost_usd']:.4f}")
+    for key in ("deepseek_flash", "gemini_flash", "deepseek_pro", "gemini_eval_pro"):
+        c = cost_summary.get(key)
+        if c and c.get("total_input_tokens", 0):
+            print(f"  {c['model']:<45} {c['total_input_tokens']:>10,} in  {c['total_output_tokens']:>8,} out"
+                  f"  → ${c['cost_standard_usd']:.4f} std | ${c['cost_actual_usd']:.4f} batch"
+                  f"  (saves ${c['savings_usd']:.4f})")
+    print(f"  Gemini Pro (judge) : ~${cost_summary['judge_gemini_pro']['estimated_cost_usd']:.4f}")
     print(f"  ─────────────────────────────────────────────────────")
     print(f"  TOTAL without batch : ${totals['cost_without_batch_usd']:.4f}")
     print(f"  TOTAL with batch    : ${totals['cost_with_batch_usd']:.4f}  "
@@ -588,7 +732,9 @@ def main():
     # ── Final report ──────────────────────────────────────────────────────────
     if not args.skip_report:
         report_path = write_report(
-            config, lc_results, tc_results, lc_eval, tc_eval, cost_summary, config.results_dir
+            config, lc_results, tc_results, lc_eval, tc_eval, cost_summary, config.results_dir,
+            lc_results_pro=lc_results_pro, tc_results_pro=tc_results_pro,
+            lc_eval_pro=lc_eval_pro, tc_eval_pro=tc_eval_pro,
         )
         print(f"\nFinal report: {report_path}")
 
