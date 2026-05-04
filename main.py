@@ -636,10 +636,9 @@ def main():
         print(f"  DeepSeek Pro : {config.deepseek_pro_model or '(same as flash)'}")
         print(f"  Gemini Pro   : {config.gemini_eval_pro_model or '(same as flash)'}")
 
-        if args.skip_long_context:
-            lc_results_pro = load_json_if_exists(lc_path_pro)
-            if lc_results_pro:
-                print(f"\n[skip] Loaded pro LC results from {lc_path_pro}")
+        lc_results_pro = load_json_if_exists(lc_path_pro)
+        if lc_results_pro:
+            print(f"\n[skip] Loaded pro LC results from {lc_path_pro}")
         else:
             # Ensure corpora are built (may already be done from flash run)
             if tier_corpora is None:
