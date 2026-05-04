@@ -131,6 +131,15 @@ def submit_all_tiers_batch(
     if not config.use_doubleword_batch:
         return None
 
+    # Resume from a previous submission if the batch_id file already exists
+    id_path = os.path.join(results_dir, batch_id_filename)
+    if os.path.exists(id_path):
+        with open(id_path) as f:
+            existing_id = f.read().strip()
+        if existing_id:
+            print(f"\n  [batch] Reusing existing batch job {existing_id} (from {id_path})")
+            return existing_id
+
     all_questions: List[Dict] = []
     for tier in CONTEXT_TIERS:
         ds_corpus, _ = tier_corpora[tier]
@@ -149,7 +158,6 @@ def submit_all_tiers_batch(
     )
 
     if batch_id:
-        id_path = os.path.join(results_dir, batch_id_filename)
         os.makedirs(results_dir, exist_ok=True)
         with open(id_path, "w") as f:
             f.write(batch_id)

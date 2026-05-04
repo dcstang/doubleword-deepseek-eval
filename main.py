@@ -449,6 +449,9 @@ def parse_args():
     p.add_argument("--skip-report",        action="store_true", help="Skip final report generation")
     p.add_argument("--include-pro",        action="store_true",
                    help="Also run Pro models (DEEPSEEK_PRO_MODEL + GEMINI_EVAL_PRO_MODEL) and add a 4-way comparison to the report")
+    p.add_argument("--skip-submission",    action="store_true",
+                   help="Skip all model submissions; load saved Gemini LC and TC results from disk, "
+                        "then collect any pending DeepSeek batch (reads batch ID from results/deepseek_batch_id.txt)")
     return p.parse_args()
 
 
@@ -494,6 +497,10 @@ def _responses_from_saved_lc(
 
 def main():
     args = parse_args()
+
+    if args.skip_submission:
+        args.skip_gemini_lc    = True
+        args.skip_tool_calling = True
 
     print("=" * 70)
     print("  DeepSeek-V4-Flash vs Gemini 3 Flash — Medical Evaluation")
@@ -636,10 +643,9 @@ def main():
         print(f"  DeepSeek Pro : {config.deepseek_pro_model or '(same as flash)'}")
         print(f"  Gemini Pro   : {config.gemini_eval_pro_model or '(same as flash)'}")
 
-        if args.skip_long_context:
-            lc_results_pro = load_json_if_exists(lc_path_pro)
-            if lc_results_pro:
-                print(f"\n[skip] Loaded pro LC results from {lc_path_pro}")
+        lc_results_pro = load_json_if_exists(lc_path_pro)
+        if lc_results_pro:
+            print(f"\n[skip] Loaded pro LC results from {lc_path_pro}")
         else:
             # Ensure corpora are built (may already be done from flash run)
             if tier_corpora is None:
